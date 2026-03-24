@@ -1,0 +1,28 @@
+from aiogram.fsm.state import State, StatesGroup
+
+class Meter_Readings_States(StatesGroup):
+    wait_meter_readings_state = State()
+    electricity_readings_state = State()
+    one_electricity_readings_state = State()
+    one_cold_water_readings_state = State()
+    one_hot_water_readings_state = State()
+    water_readings_state = State()
+    add_new_cold_water_readings = State()
+    add_new_hot_water_readings = State()
+    add_new_electricity_readings = State()
+    wait_ask_c_or_h_mr = State()
+    wait_hw_mr_state = State()
+    wait_cw_mr_state = State()
+    wait_el_mr_state = State()
+    wait_mr_state = State()
+    wait_mr_state_edit = State()
+    
+    edit_mr_cw = State()
+    edit_mr_hw = State()
+    edit_mr_el = State()
+    end_water_readings = State()
+    end_electricity_readings = State()
+    enter_electricity = State()
+    enter_hot_water = State()
+    enter_cold_water = State()
+    stop_enter = State()

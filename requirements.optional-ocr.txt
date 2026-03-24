@@ -1,0 +1,7 @@
+# Optional OCR/PDF stack (only if you run handlers/test_pdf_in_excel.py and similar tools)
+opencv-python==4.9.0.80
+pdf2image
+pytesseract
+camelot-py
+reportlab
+docx2pdf
