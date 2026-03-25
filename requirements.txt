@@ -17,3 +17,4 @@ pillow
 aiofiles
 python-dateutil
 certifi
+xlwings

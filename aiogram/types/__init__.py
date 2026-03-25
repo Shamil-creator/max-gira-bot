@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any, Optional
 
 from .input_file import FSInputFile, InputFile, BufferedInputFile
+
+logger = logging.getLogger(__name__)
 
 
 class MessageEntity:
@@ -122,7 +125,21 @@ class Message:
             payload = getattr(att, "payload", None)
             url = getattr(payload, "url", None) if payload is not None else None
             token = getattr(payload, "token", None) if payload is not None else None
-            file_id = url or token or self._bot.synthetic_file_id()
+
+            # Для файлов (xlsx, pdf...) используем TOKEN, чтобы сохранить имя и расширение.
+            # Для фото и видео используем URL — они работают стабильнее и им не важны имена.
+            if att_type == "file" and token:
+                file_id = token
+            else:
+                file_id = url or token or self._bot.synthetic_file_id()
+            
+            logger.debug(
+                "MAX bridge: attachment: type=%r url=%r token=%r filename=%r → file_id=%r",
+                att_type, url, token,
+                getattr(att, "filename", None),
+                file_id,
+            )
+
             if att_type == "image":
                 self.photo.append(PhotoSize(file_id=str(file_id)))
             elif att_type == "video":
@@ -130,12 +147,11 @@ class Message:
             elif att_type == "file":
                 file_name = getattr(att, "filename", None)
                 file_size = getattr(att, "size", 0) or 0
-                mime = None
                 self.document = Document(
                     file_id=str(file_id),
                     file_name=file_name,
                     file_size=int(file_size),
-                    mime_type=mime,
+                    mime_type=None,
                 )
 
     async def answer(self, text: str | None = None, reply_markup=None, parse_mode=None, attachments=None):

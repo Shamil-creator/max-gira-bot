@@ -90,13 +90,17 @@ async def get_sheet_name_bs(id_comp):
     return name 
 
 async def new_data_insert(query: str, *params):
+    conn = None
     try:
         conn = await asyncpg.connect(config.db_connection)
-        result = await conn.execute(query,*params)
+        result = await conn.execute(query, *params)
         return result
     except Exception as e:
-        print(f"Ошибка: {e}")
+        logging.error(f"Ошибка БД (new_data_insert): {e}")
         return None
+    finally:
+        if conn:
+            await conn.close()
 
 async def send_to_admin_topic(bot: Bot, text: str, reply_markup=None, parse_mode="Markdown"):
     """Отправить сообщение в единый админ-чат (без топиков)."""
@@ -687,11 +691,18 @@ async def unexpected_expenses_handler(call: CallbackQuery, state: FSMContext, bo
 @admin_router.message(StateFilter(AdminState.waiting_for_unexpected))
 async def process_unexpected_amount(message: Message, state: FSMContext, bot: Bot):
     """Обработка введенной суммы непредвиденных расходов"""
-    if message.chat.id != ADMIN_CHAT_ID:
+    # 1. Сразу пытаемся удалить сообщение пользователя для чистоты чата
+    try:
+        await bot.delete_message(message.chat.id, message.message_id)
+        logging.info(f"Удалено сообщение пользователя {message.message_id}")
+    except Exception as e:
+        logging.error(f"Не удалось удалить сообщение пользователя: {e}")
+
+    # 2. Проверяем права доступа по пользователю, а не по ID чата
+    if not await has_admin_access(message.from_user.id):
         return
     
     raw_text = message.text.replace(",", ".")
-    
     try:
         amount = float(raw_text)
         if amount < 0:
@@ -712,22 +723,13 @@ async def process_unexpected_amount(message: Message, state: FSMContext, bot: Bo
     state_data = await state.get_data()
     original_message_id = state_data.get("original_message_id")
     prompt_message_id = state_data.get("prompt_message_id")
-    last_msg_id = state_data.get("last_msg_id")  # это для другого
     
-    # УДАЛЯЕМ сообщение с запросом (которое бот отправил)
+    # УДАЛЯЕМ сообщение с запросом (которое бот отправил ранее)
     if prompt_message_id:
         try:
-            await bot.delete_message(ADMIN_CHAT_ID, prompt_message_id)
-            print(f"Удалено сообщение-приглашение {prompt_message_id}")
+            await bot.delete_message(message.chat.id, prompt_message_id)
         except Exception as e:
-            print(f"Не удалось удалить приглашение: {e}")
-    
-    # УДАЛЯЕМ сообщение пользователя с введенной суммой
-    try:
-        await bot.delete_message(ADMIN_CHAT_ID, message.message_id)
-        print(f"Удалено сообщение пользователя {message.message_id}")
-    except Exception as e:
-        print(f"Не удалось удалить сообщение пользователя: {e}")
+            logging.error(f"Не удалось удалить приглашение: {e}")
     
     # Возвращаемся в меню выбора
     await state.set_state(AdminState.collecting_data)
@@ -773,56 +775,19 @@ async def process_unexpected_amount(message: Message, state: FSMContext, bot: Bo
     builder.button(text="❌ Отмена", callback_data="admin_cancel")
     builder.adjust(1)
     
-    # РЕДАКТИРУЕМ исходное сообщение (с кнопками)
-    if original_message_id:
-        try:
-            await bot.edit_message_text(
-                chat_id=ADMIN_CHAT_ID,
-                message_id=original_message_id,  # Редактируем исходное сообщение!
-                text=report,
-                reply_markup=builder.as_markup(),
-                parse_mode=ParseMode.HTML
-            )
-            # Обновляем last_msg_id на отредактированное сообщение
-            await state.update_data(last_msg_id=original_message_id)
-        except Exception as e:
-            print(f"Ошибка редактирования исходного сообщения: {e}")
-            # Если не получилось отредактировать - отправляем новое
-            new_msg = await bot.send_message(
-                chat_id=ADMIN_CHAT_ID,
-                text=report,
-                reply_markup=builder.as_markup(),
-                parse_mode=ParseMode.HTML
-            )
-            await state.update_data(last_msg_id=new_msg.message_id)
-    else:
-        # Если нет original_message_id - используем старую логику
-        if last_msg_id:
-            try:
-                await bot.edit_message_text(
-                    chat_id=ADMIN_CHAT_ID,
-                    message_id=last_msg_id,
-                    text=report,
-                    reply_markup=builder.as_markup(),
-                    parse_mode=ParseMode.HTML
-                )
-            except Exception as e:
-                print(f"Ошибка редактирования: {e}")
-                new_msg = await bot.send_message(
-                    chat_id=ADMIN_CHAT_ID,
-                    text=report,
-                    reply_markup=builder.as_markup(),
-                    parse_mode=ParseMode.HTML
-                )
-                await state.update_data(last_msg_id=new_msg.message_id)
-        else:
-            new_msg = await bot.send_message(
-                chat_id=ADMIN_CHAT_ID,
-                text=report,
-                reply_markup=builder.as_markup(),
-                parse_mode=ParseMode.HTML
-            )
-            await state.update_data(last_msg_id=new_msg.message_id)
+    # Отправляем НОВОЕ сообщение с отчетом (чтобы оно было внизу чата)
+    try:
+        new_msg = await bot.send_message(
+            chat_id=message.chat.id,
+            text=report,
+            reply_markup=builder.as_markup(),
+            parse_mode=ParseMode.HTML
+        )
+        # Сохраняем ID нового сообщения как последнее активное
+        await state.update_data(last_msg_id=new_msg.message_id)
+        logging.info(f"Отправлен новый отчет по расходам: {new_msg.message_id}")
+    except Exception as e:
+        logging.error(f"Ошибка отправки нового отчета: {e}")
 
 @admin_router.callback_query(F.data == "add_document_unexpected", StateFilter(AdminState.collecting_data))
 async def add_unexpected_docs(call: CallbackQuery, state: FSMContext, bot: Bot):
@@ -863,21 +828,39 @@ async def process_unexpected_document(message: Message, state: FSMContext, bot: 
     if 'unexpected' not in temp_documents:
         temp_documents['unexpected'] = {'files': []}
     
-    file_info = {
-        'file_id': message.document.file_id,
-        'file_name': message.document.file_name,
-        'file_size': message.document.file_size,
-        'mime_type': message.document.mime_type
-    }
+    doc = message.document
+    temp_documents['unexpected']['files'].append({
+        'file_id': doc.file_id,
+        'file_name': doc.file_name,
+        'file_size': doc.file_size,
+        'mime_type': doc.mime_type
+    })
     
-    temp_documents['unexpected']['files'].append(file_info)
-    
-    file_list = "\n".join([f"📄 {f['file_name']}" for f in temp_documents['unexpected']['files']])
-    
+    file_list = get_file_list_text(temp_documents['unexpected']['files'])
     await message.answer(
-        f"✅ <b>Файл добавлен!</b>\n\n"
-        f"<b>Загруженные файлы (непредвиденные расходы):</b>\n{file_list}\n\n"
-        f"Можете добавить еще или отправить.",
+        f"✅ <b>Файл добавлен!</b>\n\n<b>Загруженные файлы (непредвиденные расходы):</b>\n{file_list}\n\nМожете добавить еще или отправить.",
+        reply_markup=create_document_keyboard_unexpected(has_files=True),
+        parse_mode=ParseMode.HTML
+    )
+    await state.set_state(AdminState.waiting_for_documents_unexpected)
+
+@admin_router.message(AdminState.confirming_documents_unexpected, F.photo)
+async def process_unexpected_photo(message: Message, state: FSMContext, bot: Bot):
+    """Обработка фото для непредвиденных расходов"""
+    if 'unexpected' not in temp_documents:
+        temp_documents['unexpected'] = {'files': []}
+    
+    photo = message.photo[-1]
+    temp_documents['unexpected']['files'].append({
+        'file_id': photo.file_id,
+        'file_name': f"photo_{datetime.now().strftime('%H%M%S')}.jpg",
+        'file_size': photo.file_size,
+        'mime_type': 'image/jpeg'
+    })
+    
+    file_list = get_file_list_text(temp_documents['unexpected']['files'])
+    await message.answer(
+        f"✅ <b>Фото добавлено!</b>\n\n<b>Загруженные файлы (непредвиденные расходы):</b>\n{file_list}\n\nМожете добавить еще или отправить.",
         reply_markup=create_document_keyboard_unexpected(has_files=True),
         parse_mode=ParseMode.HTML
     )
@@ -1108,13 +1091,30 @@ async def proceed_with_sending_unexpected(call: CallbackQuery, state: FSMContext
         )
         os.unlink(file)
         
-        # Отправляем приложенные документы
+        # Отправляем приложенные документы (непредвиденные расходы)
         for doc in documents:
-            await bot.send_document(
-                chat_id=int(user),
-                document=doc['file_id'],
-                caption=f"📎 Подтверждающий документ (непредвиденные расходы): {doc['file_name']}"
-            )
+            mime = (doc.get('mime_type') or "").lower()
+            file_id = doc.get('file_id')
+            file_name = doc.get('file_name', 'Документ')
+            
+            if "image" in mime or file_name.lower().endswith(('.jpg', '.jpeg', '.png')):
+                await bot.send_photo(
+                    chat_id=int(user),
+                    photo=file_id,
+                    caption=f"📸 Подтверждающее фото (расходы)"
+                )
+            elif "video" in mime or file_name.lower().endswith(('.mp4', '.mov', '.avi')):
+                await bot.send_video(
+                    chat_id=int(user),
+                    video=file_id,
+                    caption=f"🎬 Подтверждающее видео (расходы)"
+                )
+            else:
+                await bot.send_document(
+                    chat_id=int(user),
+                    document=file_id,
+                    caption=f"📎 Подтверждающий документ (расходы): {file_name}"
+                )
         
         # await bot.send_message(chat_id=int(user), text=text_for_user)
         await asyncio.sleep(0.2)
@@ -1228,7 +1228,7 @@ async def add_unexpected_document_prompt(call: CallbackQuery, state: FSMContext,
         "📎 <b>Отправьте файл</b>\n\n"
         "Поддерживаются любые форматы:\n"
         "📄 PDF, DOC, DOCX\n"
-        "🖼️ JPG, PNG\n"
+        "🖼️ JPG, PNG (отправьте изображение именно как фото, а не файлом)\n"
         "📊 XLS, XLSX\n\n"
         "После отправки файла появится меню.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -2441,7 +2441,7 @@ async def add_final_document_prompt(call: CallbackQuery, state: FSMContext, bot:
         "📎 <b>Отправьте файл</b>\n\n"
         "Поддерживаются любые форматы:\n"
         "📄 PDF, DOC, DOCX\n"
-        "🖼️ JPG, PNG\n"
+        "🖼️ JPG, PNG (отправьте изображение именно как фото, а не файлом)\n"
         "📊 XLS, XLSX\n\n"
         "После отправки файла появится меню.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -2452,61 +2452,113 @@ async def add_final_document_prompt(call: CallbackQuery, state: FSMContext, bot:
     await call.answer()
 
 
+def get_file_list_text(files):
+    """Формирует текст списка файлов с правильными иконками"""
+    lines = []
+    for f in files:
+        mime = (f.get('mime_type') or "").lower()
+        name = f.get('file_name', 'Файл')
+        if "image" in mime or name.endswith(('.jpg', '.jpeg', '.png')):
+            icon = "🖼️"
+        elif "video" in mime or name.endswith(('.mp4', '.mov', '.avi')):
+            icon = "🎬"
+        else:
+            icon = "📄"
+        lines.append(f"{icon} {name}")
+    return "\n".join(lines)
+
 @admin_router.message(AdminState.confirming_documents, F.document)
 async def handle_document(message: Message, bot: Bot, state: FSMContext):
+    """Обработка полученного документа"""
+    if 'final' not in temp_documents:
+        temp_documents['final'] = {'files': []}
+    
     try:
-        # Получаем информацию о документе
-        document = message.document
-        file_name = document.file_name
-        file_size = document.file_size
-        mime_type = document.mime_type
+        doc = message.document
+        temp_documents['final']['files'].append({
+            'file_id': doc.file_id,
+            'file_name': doc.file_name,
+            'file_size': doc.file_size,
+            'mime_type': doc.mime_type
+        })
         
-        # Скачиваем файл
-        file = await bot.get_file(document.file_id)
-        file_path = f"downloads/documents/{file_name}"
-        
-        # Создаем директорию если её нет
-        import os
-        os.makedirs("downloads/documents", exist_ok=True)
-        
-        # Скачиваем
-        await bot.download_file(file.file_path, file_path)
-        
-        # Отправляем подтверждение
+        file_list = get_file_list_text(temp_documents['final']['files'])
         await message.answer(
-            f"✅ Документ <b>{file_name}</b> получен!\n"
-            f"Размер: {file_size} байт\n"
-            f"Тип: {mime_type}",
+            f"✅ <b>Документ добавлен!</b>\n\n<b>Загруженные файлы:</b>\n{file_list}\n\nМожете добавить еще или отправить.",
+            reply_markup=create_document_keyboard_final(has_files=True),
             parse_mode="HTML"
         )
         await state.set_state(AdminState.waiting_for_documents)
     except Exception as e:
-        await message.answer(f"❌ Ошибка при сохранении документа: {e}")
-        logging.error(f"Ошибка документа: {e}")
-
+        await message.answer(f"❌ Ошибка: {e}")
 
 @admin_router.message(AdminState.confirming_documents, F.photo)
 async def process_final_photo(message: Message, state: FSMContext, bot: Bot):
-    """Обработка полученного фото"""
+    """Обработка полученного фото — сразу кешируем байты, пока URL не истёк"""
     if 'final' not in temp_documents:
         temp_documents['final'] = {'files': []}
     
     photo = message.photo[-1]
-    file_info = {
+    
+    # Скачиваем байты СРАЗУ, пока signed URL ещё жив
+    cached_bytes = None
+    if photo.file_id and photo.file_id.startswith("http"):
+        try:
+            import aiohttp
+            async with aiohttp.ClientSession() as session:
+                async with session.get(photo.file_id) as resp:
+                    if resp.status == 200:
+                        cached_bytes = await resp.read()
+        except Exception as e:
+            logging.warning(f"Не удалось кешировать фото: {e}")
+    
+    temp_documents['final']['files'].append({
         'file_id': photo.file_id,
-        'file_name': f"photo_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg",
+        'file_name': f"photo_{datetime.now().strftime('%H%M%S')}.jpg",
         'file_size': photo.file_size,
-        'mime_type': 'image/jpeg'
-    }
+        'mime_type': 'image/jpeg',
+        'cached_bytes': cached_bytes,  # Кешированные байты (или None)
+    })
     
-    temp_documents['final']['files'].append(file_info)
-    
-    file_list = "\n".join([f"🖼️ {f['file_name']}" for f in temp_documents['final']['files']])
-    
+    file_list = get_file_list_text(temp_documents['final']['files'])
     await message.answer(
-        f"✅ <b>Фото добавлено!</b>\n\n"
-        f"<b>Загруженные файлы:</b>\n{file_list}\n\n"
-        f"Можете добавить еще или отправить.",
+        f"✅ <b>Фото добавлено!</b>\n\n<b>Загруженные файлы:</b>\n{file_list}\n\nМожете добавить еще или отправить.",
+        reply_markup=create_document_keyboard_final(has_files=True),
+        parse_mode="HTML"
+    )
+    await state.set_state(AdminState.waiting_for_documents)
+
+@admin_router.message(AdminState.confirming_documents, F.video)
+async def process_final_video(message: Message, state: FSMContext, bot: Bot):
+    """Обработка полученного видео — сразу кешируем байты"""
+    if 'final' not in temp_documents:
+        temp_documents['final'] = {'files': []}
+    
+    video = message.video
+
+    # Скачиваем байты СРАЗУ, пока signed URL ещё жив
+    cached_bytes = None
+    if video.file_id and video.file_id.startswith("http"):
+        try:
+            import aiohttp
+            async with aiohttp.ClientSession() as session:
+                async with session.get(video.file_id) as resp:
+                    if resp.status == 200:
+                        cached_bytes = await resp.read()
+        except Exception as e:
+            logging.warning(f"Не удалось кешировать видео: {e}")
+
+    temp_documents['final']['files'].append({
+        'file_id': video.file_id,
+        'file_name': f"video_{datetime.now().strftime('%H%M%S')}.mp4",
+        'file_size': getattr(video, 'file_size', 0),
+        'mime_type': 'video/mp4',
+        'cached_bytes': cached_bytes,
+    })
+    
+    file_list = get_file_list_text(temp_documents['final']['files'])
+    await message.answer(
+        f"✅ <b>Видео добавлено!</b>\n\n<b>Загруженные файлы:</b>\n{file_list}\n\nМожете добавить еще или отправить.",
         reply_markup=create_document_keyboard_final(has_files=True),
         parse_mode="HTML"
     )
@@ -2771,7 +2823,7 @@ async def proceed_with_final_save(call: CallbackQuery, state: FSMContext, bot: B
         # Дублируем файл в админский чат
         await bot.send_document(
             chat_id=call.message.chat.id,
-            document=file_id,
+            document=FSInputFile(file),
             caption=f"📁 Копия счёта, отправленного арендатору: <code>{user}</code>",
             parse_mode="HTML"
         )
@@ -2780,19 +2832,48 @@ async def proceed_with_final_save(call: CallbackQuery, state: FSMContext, bot: B
         
         # Отправляем приложенные документы
         for doc in documents:
-            if doc['mime_type'].startswith('image/'):
-                # Это фото - отправляем как фото
-                await bot.send_photo(
-                    chat_id=int(user),
-                    photo=doc['file_id'],
-                    caption=f"📸 Подтверждающее фото"
-                )
+            mime = (doc.get('mime_type') or "").lower()
+            file_id = doc.get('file_id')
+            file_name = doc.get('file_name', 'Счет')
+            cached_bytes = doc.get('cached_bytes')
+            
+            if "image" in mime or file_name.lower().endswith(('.jpg', '.jpeg', '.png')):
+                # Фото — используем кешированные байты если есть
+                if cached_bytes:
+                    from aiogram.types.input_file import BufferedInputFile
+                    photo_input = BufferedInputFile(cached_bytes, filename=file_name)
+                    await bot.send_photo(
+                        chat_id=int(user),
+                        photo=photo_input,
+                        caption=f"📸 Подтверждающее фото"
+                    )
+                else:
+                    await bot.send_photo(
+                        chat_id=int(user),
+                        photo=file_id,
+                        caption=f"📸 Подтверждающее фото"
+                    )
+            elif "video" in mime or file_name.lower().endswith(('.mp4', '.mov', '.avi')):
+                if cached_bytes:
+                    from aiogram.types.input_file import BufferedInputFile
+                    video_input = BufferedInputFile(cached_bytes, filename=file_name)
+                    await bot.send_video(
+                        chat_id=int(user),
+                        video=video_input,
+                        caption=f"🎬 Подтверждающее видео"
+                    )
+                else:
+                    await bot.send_video(
+                        chat_id=int(user),
+                        video=file_id,
+                        caption=f"🎬 Подтверждающее видео"
+                    )
             else:
-                # Это документ - отправляем как документ
+                # Это документ - отправляем как документ (токен для файлов работает)
                 await bot.send_document(
                     chat_id=int(user),
-                    document=doc['file_id'],
-                    caption=f"📎 Подтверждающий документ: {doc['file_name']}"
+                    document=file_id,
+                    caption=f"📎 Подтверждающий документ: {file_name}"
                 )
         
         # await bot.send_message(chat_id=int(user), text=text_for_user)
@@ -3241,6 +3322,7 @@ async def get_message_for_broadcast(message: Message, state: FSMContext, bot: Bo
         message_data.update({
             "message_type": "document",
             "message_content": message.document.file_id,
+            "filename": message.document.file_name,
             "caption": message.caption
         })
     elif not message.text:
@@ -3271,19 +3353,19 @@ async def get_message_for_broadcast(message: Message, state: FSMContext, bot: Bo
     else:
         preview += f"\n\n👥 Получатели: Выбранные ({len(selected_users)} чел.)"
     
-    # Редактируем сообщение с панелью
-    if admin_message_id:
-        await edit_admin_message(
-            bot,
-            admin_message_id,
-            f"📋 Предпросмотр рассылки\n\n{preview}\n\n"
-            "Подтвердите отправку:",
-            reply_markup=confirm_keyboard()
-        )
-    
+    # Отправляем НОВОЕ сообщение с предпросмотром (чтобы было внизу чата)
+    admin_message = await send_to_admin_topic(
+        bot,
+        f"📋 Предпросмотр рассылки\n\n{preview}\n\n"
+        "Подтвердите отправку:",
+        reply_markup=confirm_keyboard()
+    )
+    if admin_message:
+        await state.update_data(admin_message_id=admin_message.message_id)
+
     await state.set_state(AdminState.confirming_send)
-    
-    # Удаляем исходное сообщение чтобы не засорять чат
+
+    # Удаляем исходное сообщение пользователя (для чистоты)
     try:
         await bot.delete_message(ADMIN_CHAT_ID, message.message_id)
     except:
@@ -3327,6 +3409,19 @@ async def confirm_broadcast(call: CallbackQuery, state: FSMContext, bot: Bot):
         await state.set_state(AdminState.admin_menu)
         return
     
+    # У MAX API не всегда получается скачивать файлы по внешним ссылкам.
+    # Если это медиафайл и он сохранен в виде URL, скачаем его заранее в память.
+    media_bytes = None
+    if message_type in ("photo", "video", "document") and isinstance(message_content, str) and message_content.startswith("http"):
+        try:
+            import aiohttp
+            async with aiohttp.ClientSession() as session:
+                async with session.get(message_content) as resp:
+                    if resp.status == 200:
+                        media_bytes = await resp.read()
+        except Exception as e:
+            logging.error(f"Failed to pre-download media for broadcast: {e}")
+
     # Начинаем рассылку
     await edit_admin_message(
         bot,
@@ -3340,16 +3435,33 @@ async def confirm_broadcast(call: CallbackQuery, state: FSMContext, bot: Bot):
     success = 0
     failed = 0
     
+    # Подготавливаем медиафайл один раз перед циклом
+    current_media = message_content
+    if media_bytes:
+        import os as _os
+        from aiogram.types.input_file import BufferedInputFile
+        orig_fname = data.get("filename")
+        if not orig_fname:
+            ext = "jpg" if message_type == "photo" else "mp4" if message_type == "video" else "bin"
+            orig_fname = f"broadcast_media.{ext}"
+        # Передаём полное имя с расширением — maxapi теперь умеет сохранять его без дублирования
+        current_media = BufferedInputFile(media_bytes, filename=orig_fname)
+
+    # Если файл не скачан (передаём URL/file_id напрямую), передаём оригинальное имя для моста
+    kwargs = {}
+    if not media_bytes and data.get("filename"):
+        kwargs["filename"] = data.get("filename")
+
     for i, user_id in enumerate(targets, 1):
         try:
             if message_type == "text":
                 await bot.send_message(user_id, message_content)
             elif message_type == "photo":
-                await bot.send_photo(user_id, message_content, caption=caption)
+                await bot.send_photo(user_id, current_media, caption=caption, **kwargs)
             elif message_type == "video":
-                await bot.send_video(user_id, message_content, caption=caption)
+                await bot.send_video(user_id, current_media, caption=caption, **kwargs)
             elif message_type == "document":
-                await bot.send_document(user_id, message_content, caption=caption)
+                await bot.send_document(user_id, current_media, caption=caption, **kwargs)
             
             success += 1
             
@@ -3370,22 +3482,42 @@ async def confirm_broadcast(call: CallbackQuery, state: FSMContext, bot: Bot):
             failed += 1
             logging.error(f"Ошибка отправки {user_id}: {e}")
     
-    # Итоговый отчет
+    # Итоговый отчет + Возврат в главное меню
+    query = "SELECT COUNT(*) as count FROM users"
+    result_users = await get_data(query)
+    total_users = result_users[0]['count'] if result_users else 0
+
     report = (
         f"✅ Рассылка завершена!\n\n"
         f"📊 Итоги:\n"
         f"• 👥 Всего получателей: {len(targets)}\n"
         f"• ✅ Успешно отправлено: {success}\n"
         f"• ❌ Ошибок: {failed}\n"
-        f"• 📨 Тип сообщения: {message_type}"
+        f"• 📨 Тип сообщения: {message_type}\n\n"
+        f"🔐 <b>Административная панель</b>\n\n"
+        f"👥 Пользователей: {total_users}\n\n"
+        f"Выберите действие:"
     )
     
-    await edit_admin_message(
+    # Финализируем сообщение с прогрессом
+    try:
+        await edit_admin_message(
+            bot,
+            call.message.message_id,
+            f"✅ Рассылка завершена!\n📊 Успешно: {success}, Ошибок: {failed}"
+        )
+    except:
+        pass
+
+    # Отправляем НОВОЕ сообщение с админ-панелью
+    admin_message = await send_to_admin_topic(
         bot,
-        call.message.message_id,
         report,
-        reply_markup=admin_main_keyboard()
+        reply_markup=admin_main_keyboard(),
+        parse_mode="HTML"
     )
+    if admin_message:
+        await state.update_data(admin_message_id=admin_message.message_id)
     
     await state.set_state(AdminState.admin_menu)
     await call.answer()
@@ -3847,34 +3979,56 @@ async def process_edit_value(message: Message, state: FSMContext):
 @admin_router.callback_query(F.data.startswith('dontdeletecomp_'))
 async def delete_company_check(callback: CallbackQuery, state: FSMContext):
     data = callback.data
-    data_list = data.split('_')
-    company_id = int(data_list[1])
+    # Формат: yesdeletecomp_{company_id} или dontdeletecomp_{company_id}
+    company_id = int(data.split('_')[1])
+
     if data.startswith('yesdeletecomp_'):
         company_details = await get_company_details(company_id)
         if not company_details:
             await callback.answer("Компания не найдена!")
             return
-        
+
         company_name = company_details.get('name_company', 'Компания')
-        sheet_name = await get_sheet_name_bs(company_id)
-        await delete_sheet_in_excel(sheet_name)
-        await delete_in_excel(company_name)
-        await new_data_insert('DELETE FROM us_readings ur WHERE ur.business_id = $1',company_id)
-        await new_data_insert('DELETE FROM users us WHERE id_business = $1',company_id)   
-        await new_data_insert('DELETE FROM bussines WHERE id = $1', company_id)
-        # Здесь будет ваш код удаления компании из БД
-        # delete_company_query = "DELETE FROM Bussines WHERE id = $1"
-        # await get_data(delete_company_query, company_id)
-        
+
+        # Удаляем из Excel (не в транзакции — файловые операции)
+        try:
+            sheet_name = await get_sheet_name_bs(company_id)
+            await delete_sheet_in_excel(sheet_name)
+            await delete_in_excel(company_name)
+        except Exception as e:
+            logging.error(f"Ошибка удаления из Excel: {e}")
+
+        # Удаляем из БД единой транзакцией
+        conn = None
+        try:
+            conn = await asyncpg.connect(config.db_connection)
+            async with conn.transaction():
+                await conn.execute('DELETE FROM us_readings WHERE business_id = $1', company_id)
+                await conn.execute('DELETE FROM business_documents WHERE id_business = $1', company_id)
+                await conn.execute('DELETE FROM users WHERE id_business = $1', company_id)
+                await conn.execute('DELETE FROM bussines WHERE id = $1', company_id)
+        except Exception as e:
+            logging.error(f"Ошибка удаления компании {company_id} из БД: {e}")
+            await callback.message.edit_text(
+                text=f"❌ <b>Ошибка удаления</b>\n\nНе удалось удалить компанию <b>{company_name}</b>.\n\n"
+                     f"<i>Причина: {e}</i>\n\nПопробуйте снова или обратитесь к администратору.",
+                parse_mode=ParseMode.HTML
+            )
+            await callback.answer()
+            return
+        finally:
+            if conn:
+                await conn.close()
+
         await state.set_state(AdminState.company_list)
         keyboard = await create_companies_keyboard()
-        
+
         companies = await get_companies_from_db()
         if not companies:
             text = f"🗑️ <b>Компания удалена</b>\n\nКомпания <b>{company_name}</b> была удалена.\n\n👑 <b>Админ-панель: Управление компаниями</b>\n\n📭 <i>Компаний пока нет</i>\n\nДобавьте новую компанию:"
         else:
             text = f"🗑️ <b>Компания удалена</b>\n\nКомпания <b>{company_name}</b> была удалена.\n\n👑 <b>Админ-панель: Управление компаниями</b>\n\nВыберите компанию для управления:"
-        
+
         await callback.message.edit_text(
             text=text,
             reply_markup=keyboard,
@@ -3884,7 +4038,7 @@ async def delete_company_check(callback: CallbackQuery, state: FSMContext):
     else:
         keyboard = await create_companies_keyboard()
         await callback.message.edit_text(
-            text=f'Админ-панель: Управление компаниями\nНе удалили компанию, какое действие хотите совершить?',
+            text='Админ-панель: Управление компаниями\nНе удалили компанию, какое действие хотите совершить?',
             reply_markup=keyboard,
             parse_mode=ParseMode.HTML
         )
@@ -3933,19 +4087,19 @@ async def add_company_start(callback: CallbackQuery, state: FSMContext):
 
 
 @admin_router.message(AdminState.add_company)
-async def process_add_company(message: Message, state: FSMContext):
-    from handlers.excel_tg_test import copy_sheet_safe,safe_add_to_excel
+async def process_add_company(message: Message, state: FSMContext, bot: Bot):
+    from handlers.excel_tg_test import copy_sheet_safe, safe_add_to_excel
     from handlers.admin_meter_handlers import temp_meter_data
     data = await state.get_data()
     current_step = data.get("add_step", 1)
     new_company = data.get("new_company", {})
     add_message_id = data.get("add_message_id")
     new_value = message.text.strip()
-    
-    # Удаляем сообщение пользователя СРАЗУ (для чистоты чата)
+
+    # Удаляем сообщение пользователя один раз в начале
     try:
-        await message.delete()
-    except:
+        await bot.delete_message(chat_id=message.chat.id, message_id=message.message_id)
+    except Exception:
         pass
     
     # Шаги 1-9 (текстовые поля)
@@ -3969,11 +4123,6 @@ async def process_add_company(message: Message, state: FSMContext):
             try:
                 float(new_value)
             except ValueError:
-                try:
-                    await message.delete()
-                except:
-                    pass
-                from main import bot
                 await bot.edit_message_text(
                     chat_id=message.chat.id,
                     message_id=add_message_id,
@@ -3989,11 +4138,6 @@ async def process_add_company(message: Message, state: FSMContext):
             try:
                 float(new_value)
             except ValueError:
-                try:
-                    await message.delete()
-                except:
-                    pass
-                from main import bot
                 await bot.edit_message_text(
                     chat_id=message.chat.id,
                     message_id=add_message_id,
@@ -4009,13 +4153,8 @@ async def process_add_company(message: Message, state: FSMContext):
             try:
                 input_date = datetime.strptime(new_value, "%d.%m.%Y")
                 today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-                
+
                 if input_date < today:
-                    try:
-                        await message.delete()
-                    except:
-                        pass
-                    from main import bot
                     await bot.edit_message_text(
                         chat_id=message.chat.id,
                         message_id=add_message_id,
@@ -4027,11 +4166,6 @@ async def process_add_company(message: Message, state: FSMContext):
                     )
                     return
             except ValueError:
-                try:
-                    await message.delete()
-                except:
-                    pass
-                from main import bot
                 await bot.edit_message_text(
                     chat_id=message.chat.id,
                     message_id=add_message_id,
@@ -4047,11 +4181,6 @@ async def process_add_company(message: Message, state: FSMContext):
             try:
                 datetime.strptime(new_value, "%d.%m.%Y")
             except ValueError:
-                try:
-                    await message.delete()
-                except:
-                    pass
-                from main import bot
                 await bot.edit_message_text(
                     chat_id=message.chat.id,
                     message_id=add_message_id,
@@ -4070,13 +4199,8 @@ async def process_add_company(message: Message, state: FSMContext):
                 error_text = "❌ ИНН должен содержать только цифры."
             elif len(new_value) not in [10, 12]:
                 error_text = "❌ ИНН должен содержать 10 или 12 цифр."
-            
+
             if error_text:
-                try:
-                    await message.delete()
-                except:
-                    pass
-                from main import bot
                 await bot.edit_message_text(
                     chat_id=message.chat.id,
                     message_id=add_message_id,
@@ -4087,11 +4211,6 @@ async def process_add_company(message: Message, state: FSMContext):
                 )
                 return
             if check_in_existing_user:
-                try:
-                    await message.delete()
-                except:
-                    pass
-                from main import bot
                 await bot.edit_message_text(
                     chat_id=message.chat.id,
                     message_id=add_message_id,
@@ -4108,13 +4227,8 @@ async def process_add_company(message: Message, state: FSMContext):
                 error_text = "❌ Введите полное ФИО (минимум 3 слова). Пример: Иванов Иван Иванович"
             elif not re.match(r'^[а-яА-ЯёЁ\s\-]+$', new_value):
                 error_text = "❌ ФИО должно содержать только буквы, пробелы и дефисы."
-            
+
             if error_text:
-                try:
-                    await message.delete()
-                except:
-                    pass
-                from main import bot
                 await bot.edit_message_text(
                     chat_id=message.chat.id,
                     message_id=add_message_id,
@@ -4124,13 +4238,8 @@ async def process_add_company(message: Message, state: FSMContext):
                     parse_mode=ParseMode.HTML
                 )
                 return
-        
+
         # Сохраняем значение
-        try:
-            await message.delete()
-        except:
-            pass
-        
         new_company[field_key] = new_value
         
         # Если это последний текстовый шаг (ФИО)
@@ -4143,8 +4252,7 @@ async def process_add_company(message: Message, state: FSMContext):
                     callback_data=f"form:{form['id'] if hasattr(form, '__getitem__') else form.id}"
                 )] for form in business_forms
             ] + [[InlineKeyboardButton(text="🔙 Отмена", callback_data="back_to_list")]])
-            
-            from main import bot
+
             await bot.edit_message_text(
                 chat_id=message.chat.id,
                 message_id=add_message_id,
@@ -4157,8 +4265,7 @@ async def process_add_company(message: Message, state: FSMContext):
         else:
             # Переход к следующему шагу
             await state.update_data(new_company=new_company, add_step=current_step + 1)
-            
-            from main import bot
+
             await bot.edit_message_text(
                 chat_id=message.chat.id,
                 message_id=add_message_id,

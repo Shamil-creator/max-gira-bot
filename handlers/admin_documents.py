@@ -125,7 +125,7 @@ async def add_document_prompt(call: CallbackQuery, state: FSMContext):
         "📎 <b>Отправьте файл</b>\n\n"
         "Поддерживаются любые форматы:\n"
         "📄 PDF, DOC, DOCX\n"
-        "🖼️ JPG, PNG\n"
+        "🖼️ JPG, PNG (отправьте изображение именно как фото, а не файлом)\n"
         "📊 XLS, XLSX\n\n"
         "После отправки файла появится меню.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -329,6 +329,30 @@ async def proceed_with_sending(call: CallbackQuery, state: FSMContext, documents
     
     # Шаги 4-7 - отправка пользователям
     total_users = len(list_users)
+    
+    # Предварительно скачиваем все приложенные документы один раз, 
+    # чтобы не скачивать их заново для каждого пользователя (это надежнее и быстрее)
+    prepared_docs = []
+    if documents:
+        import aiohttp, os as _os
+        async with aiohttp.ClientSession() as session:
+            for doc in documents:
+                if isinstance(doc['file_id'], str) and doc['file_id'].startswith("http"):
+                    try:
+                        async with session.get(doc['file_id']) as resp:
+                            if resp.status == 200:
+                                media_bytes = await resp.read()
+                                from aiogram.types.input_file import BufferedInputFile
+                                # Передаём полное имя файла с расширением.
+                                # maxapi теперь умеет сохранять оригинальное расширение (xlsx, pdf, docx...)
+                                original_name = doc['file_name'] or "document"
+                                prepared_docs.append(BufferedInputFile(media_bytes, filename=original_name))
+                                continue
+                    except Exception as e:
+                        logging.error(f"Ошибка предварительного скачивания документа {doc['file_name']}: {e}")
+                # Если не скачалось или не URL, используем как есть
+                prepared_docs.append(doc)
+
     for idx, user in enumerate(list_users):
         progress = 40 + int((idx / total_users) * 40) if total_users > 0 else 60
         
@@ -365,12 +389,22 @@ async def proceed_with_sending(call: CallbackQuery, state: FSMContext, documents
         os.unlink(file)
         
         # Отправляем приложенные документы
-        for doc in documents:
-            await bot.send_document(
-                chat_id=int(user),
-                document=doc['file_id'],
-                caption=f"📎 Подтверждающий документ: {doc['file_name']}"
-            )
+        for doc in prepared_docs:
+            if isinstance(doc, dict):
+                # Если это не скачанный файл, а исходный словарь
+                await bot.send_document(
+                    chat_id=int(user),
+                    document=doc['file_id'],
+                    caption=f"📎 Подтверждающий документ: {doc['file_name']}",
+                    filename=doc['file_name']
+                )
+            else:
+                # Если это BufferedInputFile
+                await bot.send_document(
+                    chat_id=int(user),
+                    document=doc,
+                    caption=f"📎 Подтверждающий документ: {doc.filename}"
+                )
         
         await bot.send_message(chat_id=int(user), text=text_for_user)
         await asyncio.sleep(0.2)

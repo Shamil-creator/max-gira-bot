@@ -1283,75 +1283,193 @@ from docx import Document
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 
-async def create_word(id_us, count_users, all_indicators, all_information, unexpected_expenses, get_info_business, get_sheet_name):
+async def create_word(*args, **kwargs):
+    from handlers.meter_readings import get_sheet_name
+    from handlers.run import get_info_business
+    import traceback
+    
+    # 1. Порядок аргументов зависит от точки вызова
+    id_us, all_indicators, count_users, all_information = None, None, None, None
+    unexpected_expenses = 0.0
+
+    if len(args) == 4:
+        all_indicators, id_us, count_users, all_information = args
+    elif len(args) == 5:
+        all_indicators, id_us, count_users, all_information, unexpected_expenses = args
+    elif len(args) >= 7:
+        id_us, count_users, all_indicators, all_information, unexpected_expenses, _, _ = args[:7]
+    else:
+        print(f"create_word called with {len(args)} arguments, which is unexpected.")
+        return None
+
     try:
-        # 1. Подготовка базовых данных
+        # 1. Базовые данные
         count_users = int(count_users)
-        expl_amount = float(all_indicators['expl']['amount'])
-        price_for_user = round((expl_amount / count_users), 2)
+        expl_amount = float(all_indicators['expl'].get('amount', 0))
+        price_for_user = round((expl_amount / count_users), 2) if count_users > 0 else 0
         
         records_list = await get_info_business(id_us)
-        square, surname, first_name, patronymic, name_company, fodb_name = 0, "", "", "", "", ""
+        square, full_sfp, short_sfp = 0, "—", "—"
         if records_list:
-            rec = records_list[0] # Берем первую запись
-            square, surname, first_name, patronymic = rec.get('square', 0), rec.get('surname', ""), rec.get('first_name', ""), rec.get('patronymic', "")
-            name_company, fodb_name = rec.get('name_company', ""), rec.get('fodb_name', "")
+            rec = records_list[0]
+            square = rec.get('square', 0)
+            surname = rec.get('surname', "")
+            first = rec.get('first_name', "")
+            patron = rec.get('patronymic', "")
+            short_sfp = f"{surname} {first[0] if first else ''}.{patron[0] if patron else ''}."
+            full_sfp = f"{rec.get('fodb_name', '')} {rec.get('name_company', '')}"
 
-        short_sfp = f"{surname} {first_name[0] if first_name else ''}.{patronymic[0] if patronymic else ''}."
-        full_sfp = f"{fodb_name} {name_company}"
-        
         name_sheet = await get_sheet_name(id_us)
         base_path = os.getcwd()
         file_path = os.path.join(base_path, 'docs', 'ГИРА_1006теккаа2.xlsx')
         template_path = os.path.join(base_path, 'docs', 'Акт_расчета.docx')
 
-        # 2. Чтение Excel (Linux не поддерживает xlwings/Excel, читаем напрямую)
+        # 2. Пересчёт формул через xlwings (только на macOS с установленным Excel)
+        try:
+            import xlwings as xw
+            print("🔄 Пересчёт формул через xlwings...")
+            xl_app = xw.App(visible=False, add_book=False)
+            try:
+                wb_xw = xl_app.books.open(os.path.abspath(file_path))
+                xl_app.calculate()
+                wb_xw.save()
+                wb_xw.close()
+                print("✅ Формулы пересчитаны и сохранены.")
+            finally:
+                xl_app.quit()
+        except Exception as e:
+            print(f"⚠️ xlwings не сработал (продолжаем без пересчёта): {e}")
+
+        # 2а. Читаем тарифы из главного листа '0. ГИРА' (работает на любой ОС)
+        master_tariffs = {'electro': 0.0, 'water_cold': 0.0, 'water_hot': 0.0}
+        try:
+            df_master = pd.read_excel(file_path, sheet_name='0. ГИРА', header=None, engine='openpyxl').fillna(0)
+            # Тарифы находятся в строках 4, 6, 8 (индексы 3, 5, 7) в последнем заполненном столбце
+            # Находим последний ненулевой столбец для строк тарифов (3, 5, 7)
+            tariff_rows = {3: 'electro', 5: 'water_cold', 7: 'water_hot'}
+            for row_idx, key in tariff_rows.items():
+                if row_idx < len(df_master):
+                    row_vals = df_master.iloc[row_idx].tolist()
+                    # Берём последнее ненулевое значение из строки
+                    for val in reversed(row_vals):
+                        try:
+                            fval = float(val)
+                            if fval > 0:
+                                master_tariffs[key] = fval
+                                break
+                        except (TypeError, ValueError):
+                            continue
+            print(f"✅ Тарифы из '0. ГИРА': {master_tariffs}")
+        except Exception as e:
+            print(f"⚠️ Не удалось прочитать лист '0. ГИРА': {e}")
+
+        # 3. Чтение Excel
         df = pd.read_excel(file_path, sheet_name=name_sheet, engine='openpyxl').fillna(0)
-        curr, ago = datetime.now(), datetime.now() - relativedelta(months=1)
-        dates = [datetime(curr.year, curr.month, 1).date(), datetime(ago.year, ago.month, 1).date()]
+        curr_dt, ago_dt = datetime.now(), datetime.now() - relativedelta(months=1)
+        dates = [datetime(curr_dt.year, curr_dt.month, 1).date(), datetime(ago_dt.year, ago_dt.month, 1).date()]
         
-        found_cols = [df.columns.get_loc(c) for c in df.columns if isinstance(c, datetime) and c.date() in dates]
-        if len(found_cols) < 2: return None
+        found_cols = []
+        for c in df.columns:
+            if isinstance(c, datetime) and c.date() in dates:
+                found_cols.append(df.columns.get_loc(c))
+        
+        if len(found_cols) < 2:
+            print("create_word: Не найдены столбцы нужных дат.")
+            return None
 
-        data_rows = df.iloc[:, list(range(found_cols[0], found_cols[1] + 3))].values.tolist()
-        list_data = []
+        found_cols.sort()
+        start_idx, end_idx = found_cols[0], found_cols[1]
+        # Собираем данные: [Старт_Показ, ..., Конец_Показ, Конец_Потребл, Конец_Сумма]
+        col_slice = list(range(start_idx, end_idx + 3))
+        data_rows = df.iloc[:, col_slice].values.tolist()
+
+        list_needed_data = [] # Чередуем: показания, тариф...
         for i, row in enumerate(data_rows):
-            if i == 0: continue
-            if i % 2 == 0: list_data.append(row[5])
-            else: 
-                row.pop(2); row.pop(1)
-                list_data.append(row)
+            if i == 0: continue # Пропускаем заголовок
+            if i % 2 != 0: # Строка показаний (1, 3, 5, 7)
+                list_needed_data.append(row)
+            else: # Строка тарифа (2, 4, 6, 8)
+                rate = float(row[5]) if len(row) > 5 and isinstance(row[5], (int, float)) else 0.0
+                list_needed_data.append(rate)
 
-        final_list, state = [], 1
-        for i, val in enumerate(list_data):
-            if state == 2:
-                final_list[-1].append(val)
-                state = 1
-            else:
-                if i > 5:
-                    val = [val[1], val[3]] if (isinstance(val, list) and any(pd.isna(x) or (isinstance(x, float) and math.isnan(x)) for x in val)) else [val[3]]
-                final_list.append(val)
-                state += 1
+        # Формируем финальный список [[Предыдущий, Текущий, Разница, Сумма, Тариф], ...]
+        final_list = []
+        for i in range(0, len(list_needed_data), 2):
+            if i + 1 < len(list_needed_data):
+                rd, rt = list_needed_data[i], list_needed_data[i+1]
+                if isinstance(rd, list) and len(rd) >= 6:
+                    prev = float(rd[0]) if rd[0] and str(rd[0]) != 'nan' else 0.0
+                    curr = float(rd[3]) if rd[3] and str(rd[3]) != 'nan' else 0.0
+                    
+                    # 1. Расчет разницы в Python (если в Excel 0)
+                    diff = float(rd[4]) if rd[4] and str(rd[4]) != 'nan' else 0.0
+                    if diff == 0 and curr > prev:
+                        diff = round(curr - prev, 3)
+                    
+                    # 2. Определение тарифа: Excel -> лист '0. ГИРА' -> all_indicators
+                    rate = float(rt) if isinstance(rt, (int, float)) and rt > 0 else 0.0
+                    if rate == 0:
+                        type_map = {0: 'electro', 1: 'water_cold', 2: 'water_hot'}
+                        type_key = type_map.get(i // 2)
+                        # Сначала ищем в Главном листе
+                        if type_key and master_tariffs.get(type_key, 0) > 0:
+                            rate = master_tariffs[type_key]
+                            print(f"✅ Тариф '{type_key}' взят из '0. ГИРА': {rate}")
+                        # Запасной: берём из all_indicators
+                        elif type_key and type_key in all_indicators:
+                            rate = float(all_indicators[type_key].get('tariff', 0))
+                            if rate > 0:
+                                print(f"❓ Тариф '{type_key}' взят из all_indicators: {rate}")
 
-        # 3. Расчеты
-        dr_rate = float(all_indicators['drainage']['amount'])
-        sum_dr = float(final_list[1][2]) + float(final_list[2][2])
-        final_dr = round(sum_dr * dr_rate, 2)
-        heat_val = round(float(final_list[3][1]) * float(final_list[3][0]), 2)
+                    # 3. Расчет суммы в Python (если в Excel 0)
+                    total_sum = float(rd[5]) if rd[5] and str(rd[5]) != 'nan' else 0.0
+                    if total_sum == 0 and diff > 0 and rate > 0:
+                        total_sum = round(diff * rate, 2)
+                    elif total_sum == 0 and prev == 0 and curr == 0 and i // 2 >= 3:
+                        # Для фиксированных услуг (Отопление и т.д.) берем сумму из ячейки текущего месяца напрямую
+                        total_sum = float(rd[5]) if rd[5] and str(rd[5]) != 'nan' else 0.0
 
-        # 4. Работа с Word (Создание временного файла для Linux)
+                    final_list.append([prev, curr, diff, total_sum, rate])
+                else:
+                    final_list.append([0.0, 0.0, 0.0, 0.0, 0.0])
+        
+        while len(final_list) < 5: final_list.append([0.0, 0.0, 0.0, 0.0, 0.0])
+
+        # 3. Доп. расчеты
+        dr_rate = float(all_indicators.get('drainage', {}).get('amount', 0))
+        # Водоотведение (Хол_разн + Гор_разн) * ставка
+        sum_dr_vol = float(final_list[1][2]) + float(final_list[2][2])
+        final_dr_sum = round(sum_dr_vol * dr_rate, 2)
+        
+        # 4. Работа с Word
         fd, temp_path = tempfile.mkstemp(suffix='.docx')
         os.close(fd)
         copy2(template_path, temp_path)
         doc = Document(temp_path)
 
-        # Замены текста
-        subs = {'tenant_sfp': full_sfp, 'start_day': str(all_information[1]),'thisday': str(all_information[0]), 'end_day': str(all_information[2]), 
-                'monthyear': str(all_information[3]), 'square': str(square), 'tenantshortsfp': short_sfp}
+        subs = {
+            'tenant_sfp': full_sfp, 
+            'start_day': str(all_information[1]), 
+            'thisday': datetime.now().strftime("%d.%m.%Y"), 
+            'end_day': str(all_information[2]), 
+            'monthyear': str(all_information[3]), 
+            'square': str(square), 
+            'tenantshortsfp': short_sfp
+        }
         
-        for p in doc.paragraphs:
-            for k, v in subs.items():
-                if k in p.text: p.text = p.text.replace(k, v)
+        # Универсальная замена (параграфы + ячейки таблиц)
+        def replace_text(doc_obj):
+            for p in doc_obj.paragraphs:
+                for k, v in subs.items():
+                    if k in p.text: p.text = p.text.replace(k, v)
+            for t in doc_obj.tables:
+                for row in t.rows:
+                    for cell in row.cells:
+                        replace_text(cell)
+
+        replace_text(doc)
+
+        # Поиск места для таблицы
         for p in doc.paragraphs:
             if 'Table_readings' in p.text:
                 parent = p._element.getparent()
@@ -1359,7 +1477,6 @@ async def create_word(id_us, count_users, all_indicators, all_information, unexp
                 parent.remove(p._element)
                 
                 table = doc.add_table(rows=9, cols=6)
-                # Границы таблицы (inline)
                 for cell in table._element.xpath('.//w:tc'):
                     tcPr = cell.get_or_add_tcPr()
                     borders = OxmlElement('w:tcBorders')
@@ -1369,23 +1486,23 @@ async def create_word(id_us, count_users, all_indicators, all_information, unexp
                         borders.append(edge)
                     tcPr.append(borders)
 
-                # Заполнение
                 headers = ["Услуга", "Предыдущий", "Текущий", "Разница", "Ставка", "Сумма (руб.)"]
                 for j, h in enumerate(headers): table.cell(0, j).text = h
 
                 rows_data = [
                     ["Электроэнергия (кВт·ч)", str(final_list[0][0]), str(final_list[0][1]), str(final_list[0][2]), str(round(final_list[0][4], 3)), str(final_list[0][3])],
-                    ["Холодная вода (м³)", str(final_list[1][0]), str(final_list[1][1]), str(final_list[1][2]), str(round(final_list[1][4], 3)), str(round(final_list[1][4]*final_list[1][2], 2))],
-                    ["Горячая вода (м³)", str(final_list[2][0]), str(final_list[2][1]), str(final_list[2][2]), str(round(final_list[2][4], 3)), str(round(final_list[2][4]*final_list[2][2], 2))],
-                    ["Отопление", "—", "—", "—", "—", str(final_list[3][0])],
+                    ["Холодная вода (м³)", str(final_list[1][0]), str(final_list[1][1]), str(final_list[1][2]), str(round(final_list[1][4], 3)), str(final_list[1][3])],
+                    ["Горячая вода (м³)", str(final_list[2][0]), str(final_list[2][1]), str(final_list[2][2]), str(round(final_list[2][4], 3)), str(final_list[2][3])],
+                    ["Отопление", "—", "—", "—", "—", str(final_list[3][3])],
                     ["Эксплуатация", "—", "—", "—", "—", str(price_for_user)],
-                    ["Водоотведение (м³)", "—", str(sum_dr), "—", str(dr_rate), str(final_dr)],
+                    ["Водоотведение (м³)", "—", str(sum_dr_vol), "—", str(dr_rate), str(final_dr_sum)],
                     ["Непредвиденные", "—", str(unexpected_expenses), "—", "—", str(unexpected_expenses)]
                 ]
+                
                 for r_idx, r_data in enumerate(rows_data, 1):
                     for c_idx, val in enumerate(r_data): table.cell(r_idx, c_idx).text = val
 
-                all_sum = round(sum([float(r[5]) for r in rows_data if r[5] != "—"]) + heat_val, 2)
+                all_sum = round(sum([float(r[5]) for r in rows_data if str(r[5]) != "—"]), 2)
                 table.cell(8, 0).text, table.cell(8, 5).text = "ИТОГО К ОПЛАТЕ", str(all_sum)
                 parent.insert(idx, table._element)
                 break
@@ -1394,4 +1511,6 @@ async def create_word(id_us, count_users, all_indicators, all_information, unexp
         return temp_path
 
     except Exception as e:
-        print(f"Error: {e}"); return None
+        print(f"Error in create_word: {e}")
+        traceback.print_exc()
+        return None

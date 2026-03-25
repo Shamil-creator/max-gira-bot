@@ -124,6 +124,17 @@ class Bot:
             return InputMedia(item)
         return None
 
+    async def _download_to_buffer(self, url: str, filename: str) -> "BufferedInputFile":
+        """Скачать файл по URL и вернуть как BufferedInputFile для загрузки в MAX.
+        
+        Передаём filename С расширением — maxapi теперь умеет сохранять оригинальное
+        расширение (xlsx, docx, pdf и т.д.) без дублирования.
+        """
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                resp.raise_for_status()
+                data = await resp.read()
+        return BufferedInputFile(data, filename=filename)
     @staticmethod
     def _is_http_url(value: Any) -> bool:
         return isinstance(value, str) and value.startswith(("http://", "https://"))
@@ -156,14 +167,39 @@ class Bot:
         max_attachments = self._convert_reply_markup(reply_markup)
 
         if media is not None:
+            # BufferedInputFile или FSInputFile — загружаем через обычный путь
             max_attachments.insert(0, media)
             document_id = getattr(document, "path", None) or self.synthetic_file_id()
-        elif isinstance(document, str) and document.startswith("http"):
-            max_attachments.insert(
-                0,
-                Attachment(type=AttachmentType.FILE, payload=OtherAttachmentPayload(url=document)),
+
+        elif isinstance(document, str) and self._is_http_url(document):
+            # Это URL — скачиваем и заново загружаем в MAX
+            try:
+                fname = kwargs.get("filename") or "document.bin"
+                doc_buf = await self._download_to_buffer(document, fname)
+                media = self._to_input_media(doc_buf)
+                max_attachments.insert(0, media)
+                document_id = self.synthetic_file_id()
+            except Exception as e:
+                logger.warning("MAX bridge: failed to pre-download document: %s", e)
+                max_attachments.insert(
+                    0,
+                    Attachment(type=AttachmentType.FILE, payload=OtherAttachmentPayload(url=document)),
+                )
+                document_id = document
+
+        elif isinstance(document, str) and document:
+            # Это токен MAX — используем AttachmentUpload напрямую (без перезагрузки)
+            # MAX возьмёт файл из своего хранилища с оригинальным именем и расширением
+            from maxapi.types.attachments.upload import AttachmentUpload, AttachmentPayload
+            from maxapi.enums.upload_type import UploadType
+            att_upload = AttachmentUpload(
+                type=UploadType.FILE,
+                payload=AttachmentPayload(token=document),
             )
+            logger.debug("MAX bridge: sending document via token %r", document[:20])
+            max_attachments.insert(0, att_upload)
             document_id = document
+
         else:
             text = (caption + "\n" if caption else "") + f"[Документ недоступен для MAX: {document}]"
             return await self.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup, parse_mode=parse_mode)
@@ -189,19 +225,31 @@ class Bot:
 
     async def send_photo(self, chat_id, photo, caption: str | None = None, reply_markup=None, parse_mode=None, **kwargs):
         media = self._to_input_media(photo)
-        photo_id = getattr(photo, "path", None) if hasattr(photo, "path") else None
         attachments = self._convert_reply_markup(reply_markup)
+        photo_id = None
+
         if media is not None:
             attachments.insert(0, media)
-        elif self._is_http_url(photo):
-            attachments.insert(
-                0,
-                Attachment(type=AttachmentType.IMAGE, payload=OtherAttachmentPayload(url=photo)),
-            )
-            photo_id = str(photo)
+            photo_id = getattr(photo, "path", None) if hasattr(photo, "path") else self.synthetic_file_id()
+        elif isinstance(photo, str) and self._is_http_url(photo):
+            # Signed MAX URLs истекают — скачиваем байты сами и заливаем заново,
+            # иначе MAX пытается скачать по устаревшей ссылке и падает с 400.
+            try:
+                buf = await self._download_to_buffer(photo, kwargs.get("filename") or "photo.jpg")
+                attachments.insert(0, self._to_input_media(buf))
+                photo_id = self.synthetic_file_id()
+            except Exception as e:
+                logger.warning("MAX bridge: cannot download photo for re-upload (%s). Sending as text.", e)
+                text = (caption + "\n" if caption else "") + "[Фото недоступно — ссылка устарела]"
+                return await self.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup, parse_mode=parse_mode)
+        elif isinstance(photo, str) and photo:
+            # Остальные строки (не URL) — пробуем как есть через OtherAttachmentPayload
+            attachments.insert(0, Attachment(type=AttachmentType.IMAGE, payload=OtherAttachmentPayload(url=photo)))
+            photo_id = photo
         else:
             text = (caption + "\n" if caption else "") + f"[Фото недоступно для MAX: {photo}]"
             return await self.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup, parse_mode=parse_mode)
+
         response = await self._max_bot.send_message(
             chat_id=int(chat_id),
             text=caption,
@@ -221,19 +269,23 @@ class Bot:
 
     async def send_video(self, chat_id, video, caption: str | None = None, reply_markup=None, parse_mode=None, **kwargs):
         media = self._to_input_media(video)
-        video_id = getattr(video, "path", None) if hasattr(video, "path") else None
         attachments = self._convert_reply_markup(reply_markup)
+        video_id = None
+
         if media is not None:
             attachments.insert(0, media)
-        elif self._is_http_url(video):
+            video_id = getattr(video, "path", None) if hasattr(video, "path") else self.synthetic_file_id()
+
+        elif isinstance(video, str) and video:
             attachments.insert(
                 0,
                 Attachment(type=AttachmentType.VIDEO, payload=OtherAttachmentPayload(url=video)),
             )
-            video_id = str(video)
+            video_id = video
         else:
             text = (caption + "\n" if caption else "") + f"[Видео недоступно для MAX: {video}]"
             return await self.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup, parse_mode=parse_mode)
+
         response = await self._max_bot.send_message(
             chat_id=int(chat_id),
             text=caption,
