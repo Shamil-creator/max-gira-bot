@@ -314,51 +314,27 @@ def check_formulas(sheet):
 async def get_volume_and_amount_month(id_us):
     from handlers.meter_readings import get_sheet_name
     records_list = await get_info_business(id_us)
+    square = 0
     if records_list:
-        for list in records_list:
-            square = list['square']
+        for item in records_list:
+            square = item['square']
     name_sheet = await get_sheet_name(id_us)
     file_path = 'docs/ГИРА_1006теккаа2.xlsx'
 
-     # ======== XLWINGS ДЛЯ ВЫЧИСЛЕНИЯ ФОРМУЛ ========
-    try:
-        import xlwings
-        from openpyxl import load_workbook
-        
-        print("🔥 ВЫЧИСЛЯЮ ФОРМУЛЫ ЧЕРЕЗ XLWINGS...")
-        
-        excel_app = xlwings.App(visible=False)
-        excel_book = excel_app.books.open(os.path.abspath(file_path))
-        excel_book.save()
-        excel_book.close()
-        excel_app.quit()
-        
-        print("✅ ФОРМУЛЫ ВЫЧИСЛЕНЫ!")
-        
-    except Exception as e:
-        print(f"⚠️ Xlwings не сработал: {e}")
-
+    # Читаем данные. На Linux нам не нужен xlwings, используем pandas напрямую.
+    df = pd.read_excel(file_path, sheet_name=name_sheet, engine='openpyxl')
     
-    df = pd.read_excel(file_path, sheet_name=name_sheet,engine='openpyxl')
     current_date = datetime.now()
     date_month_ago = current_date - relativedelta(months=1)
-    date_two_month_ago = current_date - relativedelta(months=2)
+    # Месяц назад - это начало периода для расчетов
     start_date = datetime(current_date.year, current_date.month, 1)
     end_date = datetime(date_month_ago.year, date_month_ago.month, 1)
-    print(f'Время старта{start_date}')
-    print(f'Время завершения{end_date}')
+
     found_columns = []
     for col in df.columns:
         col_date = None
-        
-        # Получаем дату из колонки
         if isinstance(col, datetime):
             col_date = col
-        # elif isinstance(col, str):
-        #     try:
-        #         col_date = pd.to_datetime(col, dayfirst=True)
-        #     except:
-        #         continue
         
         if col_date:
             if col_date.date() == start_date.date():
@@ -367,88 +343,124 @@ async def get_volume_and_amount_month(id_us):
             elif col_date.date() == end_date.date():
                 index = df.columns.get_loc(col)
                 found_columns.append(index)
+    
+    if len(found_columns) < 2:
+        print("❌ Не найдены нужные колонки с датами")
+        return "Ошибка: данные за отчетный период не найдены в таблице."
+
     start_index = found_columns[0]
     end_index = found_columns[1]
-    new_found_columns = []
-    while start_index != end_index+3:
-        new_found_columns.append(start_index)
-        start_index+=1
-        print(start_index)
-    data_in_columns = df.iloc[:,new_found_columns].values.tolist()
-    print(f'Проверка на забранные таблицы из таблицы {data_in_columns}')
+    
+    # Собираем данные из соответствующих колонок
+    col_range = []
+    curr_idx = start_index
+    while curr_idx != end_index + 3:
+        col_range.append(curr_idx)
+        curr_idx += 1
+    
+    data_in_columns = df.iloc[:, col_range].values.tolist()
+    
+    # Преобразуем данные в удобный формат, игнорируя пустые строки и заголовки
     list_needed_data = []
-    row_index = 0
-    for row_data in data_in_columns:
-        if row_index == 0:
-            pass
-        elif row_index % 2 == 0:
+    for row_index, row_data in enumerate(data_in_columns):
+        if row_index == 0: continue
+        if row_index % 2 == 0:
             list_needed_data.append(row_data[5])
         else:
-            row_data.pop(2)
-            row_data.pop(1)
-            list_needed_data.append(row_data)
-        row_index+=1
-    print(f'Полученные нужные показатели {list_needed_data}')
-    final_row_index = 1
-    final_count_row = 0
-    final_list = []
-    for final_data in list_needed_data:
-        print(f'отслеживаем данные, которые нужны {final_data}')
-        if final_count_row <= 5:
-            if final_row_index == 2:
-                current_value = final_data
-                final_list[-1].append(current_value)
-                final_row_index = 1
-            else: 
-                final_list.append(final_data)
-                final_row_index+=1
-            final_count_row+=1
-        else:
-            if final_row_index == 2:
-                current_value = final_data
-                final_list[-1].append(final_data)
-                final_row_index = 1
-            else: 
-                short_list = [final_data[3]]
-                final_list.append(short_list)
-                final_row_index+=1  
-        # final_list.append(final_data)
-    final_count_row_new = 0
-    services_dict = {
-    '⚡️ Электроэнергия': ['• Показатели за предыдущий месяц:', '• Показатели за текущий месяц:', '• Разница:','• Ставка:', '• Сумма к оплате:'],
-    '🚰 Холодная вода': ['• Показатели за предыдущий месяц:', '• Показатели за текущий месяц:', '• Разница:','• Ставка:', '• Сумма к оплате:'],
-    '🔥 Горячая вода': ['• Показатели за предыдущий месяц:', '• Показатели за текущий месяц:', '• Разница:','• Ставка:', '• Сумма к оплате:'],
-    '🌡 Отопление': ['• Ставка:', '• Площадь:', '• Сумма:'],
-    '🏢 Эксплуатационные услуги': ['• Сумма:']
-    }
-    print(f'Итоговые данные, после преобразований\n{final_list}')
-    text = f'📍Счёт за прошлый месяц\n\n'
-    sum = 0
-    for readings in final_list:
-        if final_count_row_new == 0:
-            electricity_template = services_dict['⚡️ Электроэнергия']
-            text+= f'⚡️ Электроэнергия\n{electricity_template[0]} {readings[0]}\n{electricity_template[1]} {readings[1]}\n{electricity_template[2]} {readings[2]}\n{electricity_template[3]} {readings[4]:.2f}\n{electricity_template[4]} {readings[3]:.2f}\n\n'
-            sum+=float(readings[3])
-        elif final_count_row_new == 1:
-            cold_water_template = services_dict['🚰 Холодная вода']
-            text+= f'🚰 Холодная вода\n{cold_water_template[0]} {readings[0]}\n{cold_water_template[1]} {readings[1]}\n{cold_water_template[2]} {readings[2]}\n{cold_water_template[3]} {readings[4]:.2f}\n{cold_water_template[4]} {readings[3]:.2f}\n\n'
-            sum+=float(readings[3])        
-        elif final_count_row_new == 2:
-            hot_water_template = services_dict['🔥 Горячая вода']
-            text+= f'🔥 Горячая вода\n{hot_water_template[0]} {readings[0]}\n{hot_water_template[1]} {readings[1]}\n{hot_water_template[2]} {readings[2]}\n{hot_water_template[3]} {readings[4]:.2f}\n{hot_water_template[4]} {readings[3]:.2f}\n\n'
-            sum+=float(readings[3])
-        elif final_count_row_new == 3:
-            heating_template = services_dict['🌡 Отопление']
-            a = readings
-            text+= f'🌡 Отопление\n{heating_template[0]} {a[1]:.2f}\n{heating_template[1]} {square}\n{heating_template[2]} {a[0]:.2f}\n\n'
-            sum+=float(a[0])
-        elif final_count_row_new == 4:
-            expluatance_template = services_dict['🏢 Эксплуатационные услуги']
-            text+= f'🏢 Эксплуатационные услуги\n{expluatance_template[0]} {readings[0]:.2f}\n'
-            sum+=float(readings[0])
-        final_count_row_new+=1
-    text+=f'\n\n---------------\nИтого: {sum:.2f}'
+            # Убираем лишние элементы как в оригинале
+            modified_row = row_data.copy()
+            modified_row.pop(2)
+            modified_row.pop(1)
+            list_needed_data.append(modified_row)
 
+    # Группируем данные по услугам [Электро, ХВ, ГВ, Отопление, Экспл]
+    # Собираем данные из соответствующих колонок
+    col_range = list(range(start_index, end_index + 3))
+    data_in_columns = df.iloc[:, col_range].values.tolist()
+
+    final_list = []
+    
+    # ЭЛЕКТРОЭНЕРГИЯ (Строка 3 -> row_index 2)
+    try:
+        e_row = data_in_columns[2]
+        e_prev = e_row[0] if not pd.isna(e_row[0]) else 0
+        e_curr = e_row[1] if not pd.isna(e_row[1]) else 0
+        e_vol = e_curr - e_prev
+        e_sum = e_row[3] if not pd.isna(e_row[3]) else 0
+        e_rate = e_vol / e_sum if e_sum != 0 else 0
+        final_list.append([e_prev, e_curr, e_vol, e_sum, e_rate])
+    except: final_list.append([0, 0, 0, 0, 0])
+
+    # ХОЛОДНАЯ ВОДА (Строка 5 -> row_index 4, Тариф в Строке 6 -> row_index 5)
+    try:
+        cw_row = data_in_columns[4]
+        cw_rate = data_in_columns[5][5] if len(data_in_columns[5]) > 5 else 0
+        prev, curr = cw_row[0] or 0, cw_row[1] or 0
+        diff = curr - prev
+        amt = diff * cw_rate if not pd.isna(cw_rate) else 0
+        final_list.append([prev, curr, diff, amt, cw_rate])
+    except: final_list.append([0, 0, 0, 0, 0])
+
+    # ГОРЯЧАЯ ВОДА (Строка 7 -> row_index 6, Тариф в Строке 8 -> row_index 7)
+    try:
+        hw_row = data_in_columns[6]
+        hw_rate = data_in_columns[7][5] if len(data_in_columns[7]) > 5 else 0
+        prev, curr = hw_row[0] or 0, hw_row[1] or 0
+        diff = curr - prev
+        amt = diff * hw_rate if not pd.isna(hw_rate) else 0
+        final_list.append([prev, curr, diff, amt, hw_rate])
+    except: final_list.append([0, 0, 0, 0, 0])
+
+    # ОТОПЛЕНИЕ (Берем тариф из строки 8)
+    try:
+        heat_rate = data_in_columns[7][5] if len(data_in_columns[7]) > 5 else 0
+        final_list.append([heat_rate * square, heat_rate])
+    except: final_list.append([0, 0])
+
+    # ЭКСПЛУАТАЦИЯ (Строка 11 -> row_index 10)
+    try:
+        expl_total = data_in_columns[10][3] if len(data_in_columns[10]) > 3 else 0
+        final_list.append([expl_total / 8 if not pd.isna(expl_total) else 0])
+    except: final_list.append([0])
+
+    services_dict = {
+        '⚡️ Электроэнергия': ['• Показатели за предыдущий месяц:', '• Показатели за текущий месяц:', '• Разница:', '• Ставка:', '• Сумма к оплате:'],
+        '🚰 Холодная вода': ['• Показатели за предыдущий месяц:', '• Показатели за текущий месяц:', '• Разница:', '• Ставка:', '• Сумма к оплате:'],
+        '🔥 Горячая вода': ['• Показатели за предыдущий месяц:', '• Показатели за текущий месяц:', '• Разница:', '• Ставка:', '• Сумма к оплате:'],
+        '🌡 Отопление': ['• Ставка:', '• Площадь:', '• Сумма:'],
+        '🏢 Эксплуатационные услуги': ['• Сумма:']
+    }
+
+    text = f'📍 Счёт за прошлый месяц\n\n'
+    total_sum = 0
+    
+    for idx, readings in enumerate(final_list):
+        try:
+            if idx == 0: # Электро
+                t = services_dict['⚡️ Электроэнергия']
+                text += f"⚡️ Электроэнергия\n{t[0]} {readings[0]}\n{t[1]} {readings[1]}\n{t[2]} {readings[2]}\n{t[3]} {readings[4]:.2f}\n{t[4]} {readings[3]:.2f}\n\n"
+                total_sum += float(readings[3])
+            elif idx == 1: # ХВ
+                t = services_dict['🚰 Холодная вода']
+                text += f"🚰 Холодная вода\n{t[0]} {readings[0]}\n{t[1]} {readings[1]}\n{t[2]} {readings[2]}\n{t[3]} {readings[4]:.2f}\n{t[4]} {readings[3]:.2f}\n\n"
+                total_sum += float(readings[3])
+            elif idx == 2: # ГВ
+                t = services_dict['🔥 Горячая вода']
+                text += f"🔥 Горячая вода\n{t[0]} {readings[0]}\n{t[1]} {readings[1]}\n{t[2]} {readings[2]}\n{t[3]} {readings[4]:.2f}\n{t[4]} {readings[3]:.2f}\n\n"
+                total_sum += float(readings[3])
+            elif idx == 3: # Отопление
+                t = services_dict['🌡 Отопление']
+                text += f"🌡 Отопление\n{t[0]} {readings[1]:.2f}\n{t[1]} {square}\n{t[2]} {readings[0]:.2f}\n\n"
+                total_sum += float(readings[0])
+            elif idx == 4: # Эксплуатация
+                t = services_dict['🏢 Эксплуатационные услуги']
+                text += f"🏢 Эксплуатационные услуги\n{t[0]} {readings[0]:.2f}\n"
+                total_sum += float(readings[0])
+        except (IndexError, ValueError, TypeError) as e:
+            print(f"Ошибка при обработке услуги {idx}: {e}")
+            continue
+
+    text += f'\n---------------\nИтого: {total_sum:.2f}'
     return text 
 
 async def save_mr_result_in_excel(name_sheet,us_readings, type_id):
@@ -532,115 +544,80 @@ async def create_excel(all_indicators,id_us,count_users):
     name_sheet = await get_sheet_name(id_us)
     file_path = 'docs/ГИРА_1006теккаа2.xlsx'
     
-    # ======== XLWINGS ДЛЯ ВЫЧИСЛЕНИЯ ФОРМУЛ ========
-    try:
-        import xlwings
-        print("🔥 ВЫЧИСЛЯЮ ФОРМУЛЫ ЧЕРЕЗ XLWINGS...")
-        
-        excel_app = xlwings.App(visible=False)
-        excel_book = excel_app.books.open(os.path.abspath(file_path))
-        excel_book.save()
-        excel_book.close()
-        excel_app.quit()
-        print("✅ ФОРМУЛЫ ВЫЧИСЛЕНЫ!")
-    except Exception as e:
-        print(f"⚠️ Xlwings не сработал: {e}")
-    
     # ======== ЧИТАЕМ ДАННЫЕ ИЗ EXCEL ========
+    # Используем pandas напрямую, xlwings на Linux не сработает
     df = pd.read_excel(file_path, sheet_name=name_sheet, engine='openpyxl')
     
     # Вычисляем даты
     current_date = datetime.now()
     date_month_ago = current_date - relativedelta(months=1)
-    date_two_month_ago = current_date - relativedelta(months=2)
     start_date = datetime(current_date.year, current_date.month, 1)
     end_date = datetime(date_month_ago.year, date_month_ago.month, 1)
-    
-    print(f'Время старта: {start_date}')
-    print(f'Время завершения: {end_date}')
     
     # Находим нужные колонки по датам
     found_columns = []
     for col in df.columns:
         col_date = None
-        
         if isinstance(col, datetime):
             col_date = col
-        
-        if col_date:
-            if col_date.date() == start_date.date():
-                index = df.columns.get_loc(col)
-                found_columns.append(index)
-            elif col_date.date() == end_date.date():
-                index = df.columns.get_loc(col)
-                found_columns.append(index)
+        if col_date and col_date.date() == start_date.date():
+            found_columns.append(df.columns.get_loc(col))
+        elif col_date and col_date.date() == end_date.date():
+            found_columns.append(df.columns.get_loc(col))
     
     if len(found_columns) < 2:
-        print("❌ Не найдены нужные колонки с датами")
+        print("❌ Не найдены нужные колонки с датами для формирования отчета")
         return None
+    start_index, end_index = found_columns[0], found_columns[1]
+    col_range = list(range(start_index, end_index + 3))
+    data_in_columns = df.iloc[:, col_range].values.tolist()
     
-    start_index = found_columns[0]
-    end_index = found_columns[1]
-    
-    # Получаем диапазон колонок
-    new_found_columns = []
-    while start_index != end_index + 3:
-        new_found_columns.append(start_index)
-        start_index += 1
-    
-    # Получаем данные из нужных колонок
-    data_in_columns = df.iloc[:, new_found_columns].values.tolist()
-    print(f'Проверка на забранные таблицы из таблицы {data_in_columns}')
-    
-    # Формируем list_needed_data
-    list_needed_data = []
-    row_index = 0
-    for row_data in data_in_columns:
-        if row_index == 0:
-            pass
-        elif row_index % 2 == 0:
-            list_needed_data.append(row_data[5])
-        else:
-            row_data.pop(2)
-            row_data.pop(1)
-            list_needed_data.append(row_data)
-        row_index += 1
-    
-    print(f'Полученные нужные показатели {list_needed_data}')
-    
-    # Формируем final_list
-    final_row_index = 1
-    final_count_row = 0
+    # Формируем final_list с расчетами на стороне Python
     final_list = []
     
-    for final_data in list_needed_data:
-        print(f'отслеживаем данные, которые нужны {final_data}')
-        if final_count_row <= 5:
-            if final_row_index == 2:
-                current_value = final_data
-                final_list[-1].append(current_value)
-                final_row_index = 1
-            else: 
-                final_list.append(final_data)
-                final_row_index += 1
-            final_count_row += 1
-        else:
-            if final_row_index == 2:
-                current_value = final_data
-                final_list[-1].append(current_value)
-                final_row_index = 1
-            else:
-                # Проверяем, является ли final_data списком с nan
-                if isinstance(final_data, list) and any(isinstance(x, float) and math.isnan(x) for x in final_data if isinstance(x, float)):
-                    # Берем оба нужных значения сразу: [индекс1, индекс3]
-                    short_list = [final_data[1], final_data[3]]  # [1234, 12]
-                else:
-                    short_list = [final_data[3]]  # оригинальная логика
-                    
-                final_list.append(short_list)
-                final_row_index += 1
+    # ⚡ ЭЛЕКТРОЭНЕРГИЯ (Строка 3 -> row_index 2)
+    try:
+        e_row = data_in_columns[2]
+        e_prev, e_curr = e_row[0] or 0, e_row[1] or 0
+        e_vol = e_curr - e_prev
+        e_sum = e_row[3] or 0
+        e_rate = e_vol / e_sum if e_sum != 0 else 0
+        final_list.append([e_prev, e_curr, e_vol, e_sum, e_rate])
+    except: final_list.append([0,0,0,0,0])
+
+    # 🚰 ХВ (Строка 5, Тариф в Строке 6)
+    try:
+        cw_row = data_in_columns[4]
+        cw_rate = data_in_columns[5][5] if len(data_in_columns[5]) > 5 else 0
+        cw_prev, cw_curr = cw_row[0] or 0, cw_row[1] or 0
+        cw_diff = cw_curr - cw_prev
+        cw_amt = cw_diff * cw_rate
+        final_list.append([cw_prev, cw_curr, cw_diff, cw_amt, cw_rate])
+    except: final_list.append([0,0,0,0,0])
+
+    # 🔥 ГВ (Строка 7, Тариф в Строке 8)
+    try:
+        hw_row = data_in_columns[6]
+        hw_rate = data_in_columns[7][5] if len(data_in_columns[7]) > 5 else 0
+        hw_prev, hw_curr = hw_row[0] or 0, hw_row[1] or 0
+        hw_diff = hw_curr - hw_prev
+        hw_amt = hw_diff * hw_rate
+        final_list.append([hw_prev, hw_curr, hw_diff, hw_amt, hw_rate])
+    except: final_list.append([0,0,0,0,0])
+
+    # 🌡 ОТОПЛЕНИЕ (Берем из доп параметров или строки 9)
+    try:
+        heat_rate = data_in_columns[7][5] if len(data_in_columns[7]) > 5 else 0
+        final_list.append([heat_rate * square, heat_rate])
+    except: final_list.append([0, 0])
+
+    # 🏢 ЭКСПЛУАТАЦИЯ (Строка 11, делим строго на 8)
+    try:
+        expl_total = data_in_columns[10][3] if len(data_in_columns[10]) > 3 else 0
+        final_list.append([expl_total / 8])
+    except: final_list.append([0])
     
-    print(f"✅ final_list получен: {final_list}")
+    print(f"✅ Расчетный final_list готов: {final_list}")
     print(f'{all_indicators}')
     # ======== СОЗДАЕМ ВРЕМЕННЫЙ EXCEL ФАЙЛ ========
     temp_dir = tempfile.gettempdir()
@@ -846,21 +823,8 @@ async def create_excel(all_indicators,id_us,count_users):
     wb.save(temp_file)
     wb.close()
     
-    # Вычисляем формулы через xlwings
-    try:
-        import xlwings
-        print("🔥 ВЫЧИСЛЯЮ ФОРМУЛЫ В ФИНАЛЬНОМ ФАЙЛЕ...")
-        
-        excel_app = xlwings.App(visible=False)
-        excel_book = excel_app.books.open(os.path.abspath(temp_file))
-        excel_book.api.Calculate()
-        excel_book.save()
-        excel_book.close()
-        excel_app.quit()
-        
-        print("✅ ФОРМУЛЫ ВЫЧИСЛЕНЫ!")
-    except Exception as e:
-        print(f"⚠️ Xlwings не сработал: {e}")
+    # На Linux мы не используем xlwings для пересчета в финальном файле.
+    # Формулы будут пересчитаны на стороне пользователя при открытии в Excel.
     
     print(f"✅ Временный файл создан: {temp_file}")
     return temp_file
@@ -1305,8 +1269,9 @@ async def create_word(*args, **kwargs):
     try:
         # 1. Базовые данные
         count_users = int(count_users)
-        expl_amount = float(all_indicators['expl'].get('amount', 0))
-        price_for_user = round((expl_amount / count_users), 2) if count_users > 0 else 0
+        expl_total = float(all_indicators['expl'].get('amount', 0))
+        # Делим строго на 8 для пользователя
+        price_for_user = round((expl_total / 8), 2)
         
         records_list = await get_info_business(id_us)
         square, full_sfp, short_sfp = 0, "—", "—"
@@ -1324,29 +1289,16 @@ async def create_word(*args, **kwargs):
         file_path = os.path.join(base_path, 'docs', 'ГИРА_1006теккаа2.xlsx')
         template_path = os.path.join(base_path, 'docs', 'Акт_расчета.docx')
 
-        # 2. Пересчёт формул через xlwings (только на macOS с установленным Excel)
-        try:
-            import xlwings as xw
-            print("🔄 Пересчёт формул через xlwings...")
-            xl_app = xw.App(visible=False, add_book=False)
-            try:
-                wb_xw = xl_app.books.open(os.path.abspath(file_path))
-                xl_app.calculate()
-                wb_xw.save()
-                wb_xw.close()
-                print("✅ Формулы пересчитаны и сохранены.")
-            finally:
-                xl_app.quit()
-        except Exception as e:
-            print(f"⚠️ xlwings не сработал (продолжаем без пересчёта): {e}")
+        # На Linux мы не используем xlwings. Расчеты производятся ниже на стороне Python
+        # для обеспечения корректности данных без участия Excel.
 
         # 2а. Читаем тарифы из главного листа '0. ГИРА' (работает на любой ОС)
         master_tariffs = {'electro': 0.0, 'water_cold': 0.0, 'water_hot': 0.0}
         try:
             df_master = pd.read_excel(file_path, sheet_name='0. ГИРА', header=None, engine='openpyxl').fillna(0)
-            # Тарифы находятся в строках 4, 6, 8 (индексы 3, 5, 7) в последнем заполненном столбце
-            # Находим последний ненулевой столбец для строк тарифов (3, 5, 7)
-            tariff_rows = {3: 'electro', 5: 'water_cold', 7: 'water_hot'}
+            # Тарифы находятся в строках 3, 6, 8 (индексы 2, 5, 7) в последнем заполненном столбце
+            # Находим последний ненулевой столбец для строк тарифов (2, 5, 7)
+            tariff_rows = {2: 'electro', 5: 'water_cold', 7: 'water_hot'}
             for row_idx, key in tariff_rows.items():
                 if row_idx < len(df_master):
                     row_vals = df_master.iloc[row_idx].tolist()
@@ -1408,16 +1360,31 @@ async def create_word(*args, **kwargs):
                     
                     # 2. Определение тарифа: Excel -> лист '0. ГИРА' -> all_indicators
                     rate = float(rt) if isinstance(rt, (int, float)) and rt > 0 else 0.0
+                    
                     if rate == 0:
                         type_map = {0: 'electro', 1: 'water_cold', 2: 'water_hot'}
                         type_key = type_map.get(i // 2)
-                        # Сначала ищем в Главном листе
-                        if type_key and master_tariffs.get(type_key, 0) > 0:
+                        
+                        # СПЕЦИАЛЬНЫЙ РАСЧЕТ ДЛЯ ЭЛЕКТРИЧЕСТВА: Сумма / Объем
+                        if type_key == 'electro' and 'electro' in all_indicators:
+                            electro_data = all_indicators['electro']
+                            calc_volume = float(electro_data.get('volume', 0))
+                            calc_amount = float(electro_data.get('amount', 0))
+                            if calc_volume > 0:
+                                rate = round(calc_amount / calc_volume, 3)
+                                print(f"📊 Тариф 'electro' рассчитан в коде (Сумма {calc_amount} / Объем {calc_volume}): {rate}")
+                        
+                        # Сначала ищем в Главном листе, если еще не определен
+                        if rate == 0 and type_key and master_tariffs.get(type_key, 0) > 0:
                             rate = master_tariffs[type_key]
                             print(f"✅ Тариф '{type_key}' взят из '0. ГИРА': {rate}")
                         # Запасной: берём из all_indicators
-                        elif type_key and type_key in all_indicators:
+                        elif rate == 0 and type_key and type_key in all_indicators:
+                            # Проверяем оба возможных ключа: 'tariff' и 'amount'
                             rate = float(all_indicators[type_key].get('tariff', 0))
+                            if rate == 0:
+                                rate = float(all_indicators[type_key].get('amount', 0))
+                                
                             if rate > 0:
                                 print(f"❓ Тариф '{type_key}' взят из all_indicators: {rate}")
 
