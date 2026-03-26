@@ -4148,30 +4148,36 @@ async def process_add_company(message: Message, state: FSMContext, bot: Bot):
             try:
                 float(new_value)
             except ValueError:
-                await bot.edit_message_text(
-                    chat_id=message.chat.id,
-                    message_id=add_message_id,
+                try:
+                    await bot.delete_message(chat_id=message.chat.id, message_id=add_message_id)
+                except:
+                    pass
+                sent_msg = await message.answer(
                     text=f"<b>Шаг 2/11</b> - Введите <b>площадь</b> (в кв.м):\n\n"
                          f"❌ Площадь должна быть числом (можно с десятичной частью).\n"
                          f"Примеры: 100, 150.5, 75.2\n\n"
                          f"Попробуйте снова:",
                     parse_mode=ParseMode.HTML
                 )
+                await state.update_data(add_message_id=sent_msg.message_id)
                 return
         
         elif current_step == 3:  # ставка
             try:
                 float(new_value)
             except ValueError:
-                await bot.edit_message_text(
-                    chat_id=message.chat.id,
-                    message_id=add_message_id,
+                try:
+                    await bot.delete_message(chat_id=message.chat.id, message_id=add_message_id)
+                except:
+                    pass
+                sent_msg = await message.answer(
                     text=f"<b>Шаг 3/11</b> - Введите <b>ставку аренды</b> (руб):\n\n"
                          f"❌ Ставка должна быть числом (можно с десятичной частью).\n"
                          f"Примеры: 1000, 1500.50, 2000\n\n"
                          f"Попробуйте снова:",
                     parse_mode=ParseMode.HTML
                 )
+                await state.update_data(add_message_id=sent_msg.message_id)
                 return
         
         elif current_step == 5:  # дата завершения
@@ -4180,41 +4186,50 @@ async def process_add_company(message: Message, state: FSMContext, bot: Bot):
                 today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
 
                 if input_date < today:
-                    await bot.edit_message_text(
-                        chat_id=message.chat.id,
-                        message_id=add_message_id,
+                    try:
+                        await bot.delete_message(chat_id=message.chat.id, message_id=add_message_id)
+                    except:
+                        pass
+                    sent_msg = await message.answer(
                         text=f"<b>Шаг 5/11</b> - Введите <b>дату завершения договора</b> (ДД.ММ.ГГГГ):\n\n"
                              f"❌ Дата должна быть больше сегодняшней.\n"
                              f"Сегодня: {today.strftime('%d.%m.%Y')}\n\n"
                              f"Попробуйте снова:",
                         parse_mode=ParseMode.HTML
                     )
+                    await state.update_data(add_message_id=sent_msg.message_id)
                     return
             except ValueError:
-                await bot.edit_message_text(
-                    chat_id=message.chat.id,
-                    message_id=add_message_id,
+                try:
+                    await bot.delete_message(chat_id=message.chat.id, message_id=add_message_id)
+                except:
+                    pass
+                sent_msg = await message.answer(
                     text=f"<b>Шаг 5/11</b> - Введите <b>дату завершения договора</b> (ДД.ММ.ГГГГ):\n\n"
                          f"❌ Неверный формат даты. Введите в формате ДД.ММ.ГГГГ\n"
                          f"Например: 31.12.2024\n\n"
                          f"Попробуйте снова:",
                     parse_mode=ParseMode.HTML
                 )
+                await state.update_data(add_message_id=sent_msg.message_id)
                 return
         
         elif current_step == 6:  # дата акта
             try:
                 datetime.strptime(new_value, "%d.%m.%Y")
             except ValueError:
-                await bot.edit_message_text(
-                    chat_id=message.chat.id,
-                    message_id=add_message_id,
+                try:
+                    await bot.delete_message(chat_id=message.chat.id, message_id=add_message_id)
+                except:
+                    pass
+                sent_msg = await message.answer(
                     text=f"<b>Шаг 6/11</b> - Введите <b>дату акта приема-передачи</b> (ДД.ММ.ГГГГ):\n\n"
                          f"❌ Неверный формат даты. Введите в формате ДД.ММ.ГГГГ\n"
                          f"Например: 31.12.2024\n\n"
                          f"Попробуйте снова:",
                     parse_mode=ParseMode.HTML
                 )
+                await state.update_data(add_message_id=sent_msg.message_id)
                 return
         
         elif current_step == 1:  # ИНН
@@ -4226,24 +4241,30 @@ async def process_add_company(message: Message, state: FSMContext, bot: Bot):
                 error_text = "❌ ИНН должен содержать 10 или 12 цифр."
 
             if error_text:
-                await bot.edit_message_text(
-                    chat_id=message.chat.id,
-                    message_id=add_message_id,
+                try:
+                    await bot.delete_message(chat_id=message.chat.id, message_id=add_message_id)
+                except:
+                    pass
+                sent_msg = await message.answer(
                     text=f"<b>Шаг 1/11</b> - Введите <b>ИНН</b> компании:\n\n"
                          f"{error_text}\n"
                          f"Попробуйте снова:",
                     parse_mode=ParseMode.HTML
                 )
+                await state.update_data(add_message_id=sent_msg.message_id)
                 return
             if check_in_existing_user:
-                await bot.edit_message_text(
-                    chat_id=message.chat.id,
-                    message_id=add_message_id,
+                try:
+                    await bot.delete_message(chat_id=message.chat.id, message_id=add_message_id)
+                except:
+                    pass
+                sent_msg = await message.answer(
                     text=f"<b>Шаг 1/11</b> - Введите <b>ИНН</b> компании:\n\n"
                          f"Данный ИНН уже есть в системе\n"
                          f"Попробуйте снова:",
                     parse_mode=ParseMode.HTML
                 )
+                await state.update_data(add_message_id=sent_msg.message_id)
                 return
         elif current_step == 9:  # ФИО
             error_text = None
@@ -4254,14 +4275,17 @@ async def process_add_company(message: Message, state: FSMContext, bot: Bot):
                 error_text = "❌ ФИО должно содержать только буквы, пробелы и дефисы."
 
             if error_text:
-                await bot.edit_message_text(
-                    chat_id=message.chat.id,
-                    message_id=add_message_id,
+                try:
+                    await bot.delete_message(chat_id=message.chat.id, message_id=add_message_id)
+                except:
+                    pass
+                sent_msg = await message.answer(
                     text=f"<b>Шаг 9/11</b> - Введите <b>ФИО генерального директора</b>:\n\n"
                          f"{error_text}\n"
                          f"Попробуйте снова:",
                     parse_mode=ParseMode.HTML
                 )
+                await state.update_data(add_message_id=sent_msg.message_id)
                 return
 
         # Сохраняем значение
@@ -4278,26 +4302,29 @@ async def process_add_company(message: Message, state: FSMContext, bot: Bot):
                 )] for form in business_forms
             ] + [[InlineKeyboardButton(text="🔙 Отмена", callback_data="back_to_list")]])
 
-            await bot.edit_message_text(
-                chat_id=message.chat.id,
-                message_id=add_message_id,
+            try:
+                await bot.delete_message(chat_id=message.chat.id, message_id=add_message_id)
+            except:
+                pass
+            sent_msg = await message.answer(
                 text=f"✅ <b>{field_display}</b> сохранено!\n\n"
                      f"<b>Шаг 10/11</b> - Выберите <b>форму бизнеса</b>:",
                 reply_markup=keyboard,
                 parse_mode=ParseMode.HTML
             )
-            await state.update_data(new_company=new_company, add_step=10)
+            await state.update_data(new_company=new_company, add_step=10, add_message_id=sent_msg.message_id)
         else:
             # Переход к следующему шагу
-            await state.update_data(new_company=new_company, add_step=current_step + 1)
-
-            await bot.edit_message_text(
-                chat_id=message.chat.id,
-                message_id=add_message_id,
+            try:
+                await bot.delete_message(chat_id=message.chat.id, message_id=add_message_id)
+            except:
+                pass
+            sent_msg = await message.answer(
                 text=f"✅ <b>{field_display}</b> сохранено!\n\n"
                      f"<b>Шаг {current_step + 1}/11</b> - {next_question}",
                 parse_mode=ParseMode.HTML
             )
+            await state.update_data(new_company=new_company, add_step=current_step + 1, add_message_id=sent_msg.message_id)
     
     # Финальный шаг - ввод вида деятельности
     elif current_step == 10:
@@ -4363,22 +4390,12 @@ async def process_add_company(message: Message, state: FSMContext, bot: Bot):
         if company_id in temp_meter_data:
             del temp_meter_data[company_id]
         
-        # Сохраняем данные в state для возврата
-        await state.update_data(
-            company_id=company_id,
-            return_text=company_info,
-            return_message_id=add_message_id
-        )
-        
-        # Клавиатура с вопросом о счетчиках
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="👤 Я", callback_data=f"meter_filler_admin")],
-            [InlineKeyboardButton(text="🏢 Арендатор", callback_data="meter_filler_tenant")],
-        ])
-        
-        await bot.edit_message_text(
-            chat_id=message.chat.id,
-            message_id=add_message_id,
+        try:
+            await bot.delete_message(chat_id=message.chat.id, message_id=add_message_id)
+        except:
+            pass
+            
+        sent_msg = await message.answer(
             text="✅ <b>Компания успешно создана!</b>\n\n"
                  "Теперь нужно добавить номера счетчиков:\n"
                  "• ❄️ Холодная вода\n"
@@ -4388,6 +4405,14 @@ async def process_add_company(message: Message, state: FSMContext, bot: Bot):
                  "Кто будет заполнять номера?",
             parse_mode=ParseMode.HTML,
             reply_markup=keyboard
+        )
+
+        # Сохраняем данные в state для возврата
+        await state.update_data(
+            company_id=company_id,
+            return_text=company_info,
+            return_message_id=sent_msg.message_id,
+            add_message_id=sent_msg.message_id
         )
         
         # Устанавливаем состояние выбора заполнителя (из вашего admin_states.py)
@@ -4422,15 +4447,18 @@ async def select_business_form(callback: CallbackQuery, state: FSMContext):
     new_company['id_form'] = form_id
     
     from main import bot
-    await bot.edit_message_text(
-        chat_id=callback.message.chat.id,
-        message_id=add_message_id,
+    try:
+        await bot.delete_message(chat_id=callback.message.chat.id, message_id=add_message_id)
+    except:
+        pass
+        
+    sent_msg = await callback.message.answer(
         text=f"✅ <b>Форма бизнеса</b> выбрана!\n\n"
-             f"<b>Шаг 10/10</b> - Введите <b>вид деятельности</b>:",
+             f"<b>Шаг 11/11</b> - Введите <b>вид деятельности</b>:",
         parse_mode=ParseMode.HTML
     )
     
-    await state.update_data(new_company=new_company, add_step=10)  # меняем на 10
+    await state.update_data(new_company=new_company, add_step=10, add_message_id=sent_msg.message_id)  # меняем на 10
     await callback.answer()
 
 
