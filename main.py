@@ -83,28 +83,28 @@ async def setup_scheduler():
     for id_us in list_ids:
         scheduler.add_job(
             get_message_every_month,
-            trigger=CronTrigger(day=26, hour=14, minute=30, timezone="Europe/Moscow"),
+            trigger=CronTrigger(day=26, hour=15, minute=30, timezone="Europe/Moscow"),
             args=[id_us],
             id=f"monthly_payment_msg_{id_us}",
             replace_existing=True,
         )
         scheduler.add_job(
             get_mr_message_every_month,
-            trigger=CronTrigger(day=26, hour=14, minute=31, timezone="Europe/Moscow"),
+            trigger=CronTrigger(day=26, hour=15, minute=31, timezone="Europe/Moscow"),
             args=[id_us],
             id=f"monthly_mr_msg_{id_us}",
             replace_existing=True,
         )
         scheduler.add_job(
             get_invoice_msg_every_month,
-            trigger=CronTrigger(day=26, hour=14, minute=32, timezone="Europe/Moscow"),
+            trigger=CronTrigger(day=26, hour=15, minute=32, timezone="Europe/Moscow"),
             args=[id_us],
             id=f"monthly_invoice_msg_{id_us}",
             replace_existing=True,
         )
         scheduler.add_job(
             get_act_of_payment,
-            trigger=CronTrigger(day=26, hour=14, minute=33, timezone="Europe/Moscow"),
+            trigger=CronTrigger(day=26, hour=15, minute=33, timezone="Europe/Moscow"),
             args=[id_us],
             id=f"monthly_act_msg_{id_us}",
             replace_existing=True,
