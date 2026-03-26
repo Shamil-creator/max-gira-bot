@@ -181,13 +181,14 @@ class Message:
             parse_mode=parse_mode,
         )
 
-    async def answer_document(self, document, caption: str | None = None, reply_markup=None, parse_mode=None):
+    async def answer_document(self, document, caption: str | None = None, reply_markup=None, parse_mode=None, **kwargs):
         return await self._bot.send_document(
             chat_id=self.chat.id,
             document=document,
             caption=caption,
             reply_markup=reply_markup,
             parse_mode=parse_mode,
+            **kwargs,
         )
 
     async def edit_text(self, text: str, reply_markup=None, parse_mode=None):

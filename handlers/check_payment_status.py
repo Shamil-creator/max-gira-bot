@@ -113,7 +113,10 @@ async def get_invoice_msg_every_month(id):
         number_act = 1
     full_name = f'''{fod_name} "{name}"'''
     file_path = await create_invoice_for_payment_for_user(number_act, full_name, agreement, bid)
-    document = FSInputFile(file_path)
+    # Задаем имя файла для счета
+    nice_filename = f"Счет на оплату {datetime.now().strftime('%m.%Y')}.docx"
+    document = FSInputFile(file_path, filename=nice_filename)
+    
     number_act = int(number_act)+1
     await new_data_insert('UPDATE bussines SET number_act = $1 WHERE name_company = $2',int(number_act), name)
     sent_message = await bot.send_document(chat_id=id, document=document, caption='Здравствуйте! Ваш счет за текущий месяц')
@@ -121,7 +124,7 @@ async def get_invoice_msg_every_month(id):
     file_id = sent_message.document.file_id
     records = await get_data('SELECT id_business FROM users WHERE User_Id = $1',str(id))
     id_business = records[0]['id_business']
-    await new_data_insert('INSERT INTO business_documents(id_business,file_id, date_added) VALUES ($1, $2, $3)',id_business, file_id, today_date)
+    await new_data_insert('INSERT INTO business_documents(id_business, file_id, date_added, file_name) VALUES ($1, $2, $3, $4)', id_business, file_id, today_date, nice_filename)
 
 async def get_act_of_payment(id):
     from main import bot
@@ -149,7 +152,10 @@ async def get_act_of_payment(id):
     full_name_tenant = f'{surname} {first_name} {patronymic}'
     print(f'Проверка на отправляемое {full_name_tenant}')
     file_path = await create_layoat_for_user('ООО ГИРА', name, end_str, bid, square, agreement, full_name_tenant, number_act)
-    document = FSInputFile(file_path)
+    # Задаем имя файла для акта
+    nice_filename = f"Акт {datetime.now().strftime('%m.%Y')}.docx"
+    document = FSInputFile(file_path, filename=nice_filename)
+    
     number_act = int(number_act)+1
     await new_data_insert('UPDATE bussines SET number_act = $1 WHERE square = $2 AND name_company = $3',int(number_act),square, name)
     sent_message = await bot.send_document(chat_id=id, document=document, caption='Доброе утро! Ваш Акт за текущий месяц')
@@ -157,7 +163,7 @@ async def get_act_of_payment(id):
     file_id = sent_message.document.file_id
     records = await get_data('SELECT id_business FROM users WHERE User_Id = $1',str(id))
     id_business = records[0]['id_business']
-    await new_data_insert('INSERT INTO business_documents(id_business,file_id, date_added) VALUES ($1, $2, $3)',id_business, file_id, today_date)
+    await new_data_insert('INSERT INTO business_documents(id_business, file_id, date_added, file_name) VALUES ($1, $2, $3, $4)', id_business, file_id, today_date, nice_filename)
 
 
 @payment_router.callback_query(F.data.startswith(('tenant_yes_reaction_cb','tenant_no_reaction_cb')))

@@ -174,14 +174,16 @@ async def get_menu(message: types.Message, state:FSMContext):
         for ids in records_ids:
            id_business = int(ids['id_business'])
         files_list = []
-        record_files_list = await get_data('SELECT file_id FROM business_documents WHERE id_business = $1 ORDER BY date_added', id_business)
+        record_files_list = await get_data('SELECT file_id, file_name FROM business_documents WHERE id_business = $1 ORDER BY date_added', id_business)
         if not record_files_list:
             await message.answer('У вас пока нет счетов, вы в меню')
         else:
             await message.answer('Ваши документы👇')
             for file in record_files_list:
                 try:
-                    await message.answer_document(file['file_id'])
+                    # Извлекаем сохраненное имя или ставим стандартное
+                    fname = file.get('file_name') or "Счет.docx"
+                    await message.answer_document(file['file_id'], filename=fname)
                 except Exception as e:
                     print('Ошибка с отправкой файла')
                     await message.answer('Счет был поврежден😓')

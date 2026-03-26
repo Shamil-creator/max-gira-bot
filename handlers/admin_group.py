@@ -2819,7 +2819,9 @@ async def proceed_with_final_save(call: CallbackQuery, state: FSMContext, bot: B
             )
             continue
             
-        document = FSInputFile(file)
+        # Генерируем красивое имя файла на основе периода
+        nice_filename = f"Счет {period_str}.docx"
+        document = FSInputFile(file, filename=nice_filename)
         
         caption = '🧾 Ваш счёт за прошедший месяц'
         if unexpected_expenses > 0:
@@ -2838,13 +2840,14 @@ async def proceed_with_final_save(call: CallbackQuery, state: FSMContext, bot: B
             id_business = None
         else:
             id_business = records[0]['id_business']
-            await new_data_insert('INSERT INTO business_documents(id_business,file_id, date_added) VALUES ($1, $2, $3)',id_business, file_id, today_date)
+            # Сохраняем и file_id, и оригинальное имя файла
+            await new_data_insert('INSERT INTO business_documents(id_business, file_id, date_added, file_name) VALUES ($1, $2, $3, $4)', id_business, file_id, today_date, nice_filename)
         
         # Дублируем файл в админский чат
         await bot.send_document(
             chat_id=call.message.chat.id,
-            document=FSInputFile(file),
-            caption=f"📁 Копия счёта, отправленного арендатору: <code>{user}</code>",
+            document=FSInputFile(file, filename=nice_filename),
+            caption=f"📁 Копия счёта ({nice_filename}), отправленного арендатору: <code>{user}</code>",
             parse_mode="HTML"
         )
         
