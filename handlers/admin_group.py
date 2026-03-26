@@ -4395,6 +4395,12 @@ async def process_add_company(message: Message, state: FSMContext, bot: Bot):
         except:
             pass
             
+        # Клавиатура с вопросом о счетчиках
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="👤 Я", callback_data=f"meter_filler_admin")],
+            [InlineKeyboardButton(text="🏢 Арендатор", callback_data="meter_filler_tenant")],
+        ])
+        
         sent_msg = await message.answer(
             text="✅ <b>Компания успешно создана!</b>\n\n"
                  "Теперь нужно добавить номера счетчиков:\n"
