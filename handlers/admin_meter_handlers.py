@@ -187,6 +187,10 @@ async def select_meter_type(callback: CallbackQuery, state: FSMContext):
 @admin_meter_router.message(AdminState.entering_electricity)
 async def process_meter_input(message: Message, state: FSMContext):
     """Обработка введенных номеров"""
+    try:
+        await message.delete()
+    except:
+        pass
     data = await state.get_data()
     company_id = data['company_id']
     meter_type = data['current_meter_type']

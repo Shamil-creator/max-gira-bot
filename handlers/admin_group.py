@@ -457,6 +457,10 @@ async def admin_process_type(call: CallbackQuery, state: FSMContext, bot: Bot):
 @admin_router.message(StateFilter(AdminState.waiting_for_tariff))
 async def process_tariff_input(message: Message, state: FSMContext, bot: Bot):
     """Обработка введенного тарифа для холодной воды"""
+    try:
+        await message.delete()
+    except:
+        pass
     if message.chat.id != ADMIN_CHAT_ID:
         return
     
@@ -1304,6 +1308,10 @@ async def admin_method_manual(call: CallbackQuery, state: FSMContext, bot: Bot):
 @admin_router.message(StateFilter(AdminState.waiting_for_amount_drainage))
 async def process_drainage_amount_input(message: Message, state: FSMContext, bot: Bot):
     """Обработка введенного коэфицента водоотведения"""
+    try:
+        await message.delete()
+    except:
+        pass
     if message.chat.id != ADMIN_CHAT_ID:
         return
     str_len = message.text
@@ -1387,9 +1395,17 @@ async def process_drainage_amount_input(message: Message, state: FSMContext, bot
             bot,
             f"Пожалуйста введите корректное число"
         )
+        try:
+            await message.delete()
+        except:
+            pass
 
 @admin_router.message(StateFilter(AdminState.waiting_for_amount_expl))
 async def process_amount_expl_input(message: Message, state: FSMContext, bot: Bot):
+    try:
+        await message.delete()
+    except:
+        pass
     if message.chat.id != ADMIN_CHAT_ID:
         return
     str_len = message.text
@@ -1477,6 +1493,10 @@ async def process_amount_expl_input(message: Message, state: FSMContext, bot: Bo
 @admin_router.message(StateFilter(AdminState.waiting_for_edit))
 async def process_edit_input(message: Message, state: FSMContext, bot: Bot):
     """Обработка ввода нового значения при редактировании"""
+    try:
+        await message.delete()
+    except:
+        pass
     if message.chat.id != ADMIN_CHAT_ID:
         return
     
@@ -4088,19 +4108,24 @@ async def add_company_start(callback: CallbackQuery, state: FSMContext):
 
 @admin_router.message(AdminState.add_company)
 async def process_add_company(message: Message, state: FSMContext, bot: Bot):
+    # Удаляем сообщение пользователя сразу, до обработки
+    try:
+        await bot.delete_message(chat_id=message.chat.id, message_id=message.message_id)
+    except:
+        pass
+        
     from handlers.excel_tg_test import copy_sheet_safe, safe_add_to_excel
     from handlers.admin_meter_handlers import temp_meter_data
     data = await state.get_data()
     current_step = data.get("add_step", 1)
     new_company = data.get("new_company", {})
     add_message_id = data.get("add_message_id")
+    
+    # Защита от сообщений без текста (стикеры, фото и т.д.)
+    if not message.text:
+        return
+        
     new_value = message.text.strip()
-
-    # Удаляем сообщение пользователя один раз в начале
-    try:
-        await bot.delete_message(chat_id=message.chat.id, message_id=message.message_id)
-    except Exception:
-        pass
     
     # Шаги 1-9 (текстовые поля)
     if 1 <= current_step <= 9:
@@ -4276,10 +4301,6 @@ async def process_add_company(message: Message, state: FSMContext, bot: Bot):
     
     # Финальный шаг - ввод вида деятельности
     elif current_step == 10:
-        try:
-            await message.delete()
-        except:
-            pass
         new_company['activity_type'] = new_value
         name_company = new_company.get('name_company')
         activity_type = new_company.get('activity_type')
@@ -4346,7 +4367,7 @@ async def process_add_company(message: Message, state: FSMContext, bot: Bot):
         await state.update_data(
             company_id=company_id,
             return_text=company_info,
-            return_message_id=message.message_id
+            return_message_id=add_message_id
         )
         
         # Клавиатура с вопросом о счетчиках
@@ -4355,14 +4376,16 @@ async def process_add_company(message: Message, state: FSMContext, bot: Bot):
             [InlineKeyboardButton(text="🏢 Арендатор", callback_data="meter_filler_tenant")],
         ])
         
-        await message.answer(
-            "✅ <b>Компания успешно создана!</b>\n\n"
-            "Теперь нужно добавить номера счетчиков:\n"
-            "• ❄️ Холодная вода\n"
-            "• 🔥 Горячая вода\n"
-            "• ⚡️ Электричество\n\n"
-            "<i>Номера можно будет изменить позже в настройках компании.</i>\n\n"
-            "Кто будет заполнять номера?",
+        await bot.edit_message_text(
+            chat_id=message.chat.id,
+            message_id=add_message_id,
+            text="✅ <b>Компания успешно создана!</b>\n\n"
+                 "Теперь нужно добавить номера счетчиков:\n"
+                 "• ❄️ Холодная вода\n"
+                 "• 🔥 Горячая вода\n"
+                 "• ⚡️ Электричество\n\n"
+                 "<i>Номера можно будет изменить позже в настройках компании.</i>\n\n"
+                 "Кто будет заполнять номера?",
             parse_mode=ParseMode.HTML,
             reply_markup=keyboard
         )

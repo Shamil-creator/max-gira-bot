@@ -172,6 +172,10 @@ def get_type_business_keyboard():
 
 @reg_router.message(RegStates.enterINN_state)
 async def Check_INN(message: Message, state: FSMContext):
+    try:
+        await message.delete()
+    except:
+        pass
     from handlers.run import get_menu_keyboard,check_mr_for_user_in_db
     from main import redis as r
     inn_text = message.text
@@ -198,11 +202,19 @@ async def Check_INN(message: Message, state: FSMContext):
 
 @reg_router.message(RegStates.enter_type_busines_state)
 async def first_ask(message: types.Message, state: FSMContext):
+    try:
+        await message.delete()
+    except:
+        pass
     keyboard = get_type_business_keyboard()
     await message.answer('Пожалуйста выберите форму бизнеса', reply_markup=keyboard)
 
 @reg_router.message(RegStates.enter_company_name_state)
 async def second_ask(message: types.Message, state: FSMContext):
+    try:
+        await message.delete()
+    except:
+        pass
     from services.yandex_disk import check_yes_or_no_company
     name_company = message.text
     check = check_yes_or_no_company(name_company)
@@ -214,7 +226,11 @@ async def second_ask(message: types.Message, state: FSMContext):
         await message.answer('Не нашли вашу компанию, проверьте пожалуйста название и снова введите данные')
 
 @reg_router.message(RegStates.end_reg_state)
-async def second_ask(message: types.Message, state: FSMContext):
+async def third_ask(message: types.Message, state: FSMContext):
+    try:
+        await message.delete()
+    except:
+        pass
     from handlers.run import get_menu_keyboard
     sfp = message.text
     id = message.chat.id
