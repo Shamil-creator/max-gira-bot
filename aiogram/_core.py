@@ -117,6 +117,9 @@ class Bot:
 
     def _to_input_media(self, item: Any):
         if isinstance(item, (FSInputFile, InputFile)):
+            if getattr(item, "filename", None):
+                with open(item.path, "rb") as f:
+                    return InputMediaBuffer(f.read(), filename=item.filename)
             return InputMedia(item.path)
         if isinstance(item, BufferedInputFile):
             return InputMediaBuffer(item.data, filename=item.filename)

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 @dataclass
 class FSInputFile:
     path: str
+    filename: str | None = None
 
 
 InputFile = FSInputFile
