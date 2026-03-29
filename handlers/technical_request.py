@@ -19,14 +19,16 @@ from states.auth_states import Auth_States
 from states.technical_request_states import Technical_States
 
 async def get_data(query: str, *params):
+    conn = None
     try:
         conn = await asyncpg.connect(config.db_connection)
-        result = await conn.fetch(query,*params)
-        await conn.close()
-        return result
-    except Exception as e: 
+        return await conn.fetch(query, *params)
+    except Exception as e:
         print(f"Ошибка: {e}")
         return None
+    finally:
+        if conn:
+            await conn.close()
 
 technical_request_router = Router()
 
@@ -74,14 +76,14 @@ async def get_cb(call: CallbackQuery, state: FSMContext):
         all_message = f'[ТЕХЗАЯВКА] От арендатора {name}\nCообщение: {problem_text}'
         await bot.send_message(chat_id=id_chat, text=all_message)
         await call.message.answer('Ваше обращение было передано')
-        from handlers.run import get_menu_keyboard
+        from handlers.run import build_menu_keyboard
         await state.set_state(Auth_States.menu_state)
-        await call.message.answer('Вы в меню', reply_markup=get_menu_keyboard())
+        await call.message.answer('Вы в меню', reply_markup=await build_menu_keyboard(id_us))
 
 @technical_request_router.callback_query(F.data.in_(['send_technical_request_cb']))
 async def call(call: CallbackQuery, state: FSMContext):
     from main import bot
-    from handlers.run import get_menu_keyboard
+    from handlers.run import build_menu_keyboard
     from handlers.config import config
     id_chat = config.chanel_id.get_secret_value()
     id_us = call.message.chat.id
@@ -116,7 +118,7 @@ async def call(call: CallbackQuery, state: FSMContext):
             )
     await call.message.answer('Ваше обращение было передано')
     await state.set_state(Auth_States.menu_state)
-    await call.message.answer('Вы в меню', reply_markup=get_menu_keyboard())
+    await call.message.answer('Вы в меню', reply_markup=await build_menu_keyboard(id_us))
     try:
         await bot.send_media_group(
             chat_id=id_chat,

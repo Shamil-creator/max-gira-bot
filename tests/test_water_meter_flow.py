@@ -308,7 +308,10 @@ def test_callback_go_back_moves_to_menu(monkeypatch):
     fake_bot = FakeBot()
     _install_fake_main(monkeypatch, redis=FakeRedis(), bot=fake_bot)
     add_new_mr_router._bot = fake_bot
-    monkeypatch.setattr(run_module, "get_menu_keyboard", lambda: "menu-kb")
+    async def _fake_build_menu_keyboard(_uid):
+        return "menu-kb"
+
+    monkeypatch.setattr(run_module, "build_menu_keyboard", _fake_build_menu_keyboard)
 
     ctx = _Ctx(state=Meter_Readings_States.add_new_hot_water_readings)
     asyncio.run(add_new_mr_router._dispatch_callback(_callback_event("add_hoc_go_back_cb"), ctx))
@@ -375,7 +378,10 @@ def test_one_hot_water_state_replies_for_non_digit(monkeypatch):
     fake_bot = FakeBot()
     _install_fake_main(monkeypatch, redis=FakeRedis(), bot=fake_bot)
     meter_readings_router._bot = fake_bot
-    monkeypatch.setattr(run_module, "get_menu_keyboard", lambda: "menu-kb")
+    async def _fake_build_menu_keyboard(_uid):
+        return "menu-kb"
+
+    monkeypatch.setattr(run_module, "build_menu_keyboard", _fake_build_menu_keyboard)
     monkeypatch.setattr(run_module, "smart_keyboard_mr", lambda _: SimpleNamespace(inline_keyboard=[[]]))
 
     async def _fake_save(*args, **kwargs):
@@ -396,7 +402,10 @@ def test_one_cold_water_state_replies_for_non_digit(monkeypatch):
     fake_bot = FakeBot()
     _install_fake_main(monkeypatch, redis=FakeRedis(), bot=fake_bot)
     meter_readings_router._bot = fake_bot
-    monkeypatch.setattr(run_module, "get_menu_keyboard", lambda: "menu-kb")
+    async def _fake_build_menu_keyboard(_uid):
+        return "menu-kb"
+
+    monkeypatch.setattr(run_module, "build_menu_keyboard", _fake_build_menu_keyboard)
     monkeypatch.setattr(run_module, "smart_keyboard_mr", lambda _: SimpleNamespace(inline_keyboard=[[]]))
 
     async def _fake_save(*args, **kwargs):

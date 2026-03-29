@@ -26,14 +26,17 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 import sys
 
 async def get_data(query: str, *params):
+    conn = None
     try:
         conn = await asyncpg.connect(config.db_connection)
-        result = await conn.fetch(query,*params)
-        await conn.close()
-        return result
-    except Exception as e: 
+        return await conn.fetch(query, *params)
+    except Exception as e:
         print(f"Ошибка: {e}")
         return None
+    finally:
+        if conn:
+            await conn.close()
+
     
 notifications_router = Router()
 
@@ -120,7 +123,7 @@ async def callback(call: CallbackQuery, state: FSMContext):
 @notifications_router.callback_query(F.data.in_(['notify_of_termination_cb', 'agreement_termination_of_the_contract_cb','coordination_of_repair_work_cb', 'go_menu_cb', 'yes_termination_cb', 'no_termination_cb','cancel_agreement_termination_cb']))
 async def callback(call: CallbackQuery, state: FSMContext):
     from states.repair_work_states import Repair_State
-    from handlers.run import get_info_business,get_menu_keyboard
+    from handlers.run import get_info_business, build_menu_keyboard
     from main import bot
     data = call.data
     await call.message.delete()
@@ -138,26 +141,31 @@ async def callback(call: CallbackQuery, state: FSMContext):
         except Exception as e:
             await call.message.answer(f"Ошибка: {e}")
     elif data == 'coordination_of_repair_work_cb':
-        id_us = call.message.chat.id
+        id_us = call.from_user.id
         records_list = await get_info_business(id_us)
+        toa_name = name = agreement = None
         if records_list:
             for list in records_list:
                 toa_name = list['name']
                 name = list['name_company']
                 agreement = list['agreement']
         id_admin = config.chanel_id.get_secret_value()
-        await call.message.answer('Ваша заявка принята. Техническая служба и арендодатель уведомлены')
-        await bot.send_message(
-            chat_id=id_admin,
-            text=f'[РЕМОНТ] Вид деятельности: {toa_name}\n\nНаименование: {name}\n\nДоговор📝 - {agreement}\n\nХочет провести ремонтные работы',
-        )
+        try:
+            await bot.send_message(
+                chat_id=id_admin,
+                text=f'[РЕМОНТ] Вид деятельности: {toa_name}\n\nНаименование: {name}\n\nДоговор📝 - {agreement}\n\nХочет провести ремонтные работы',
+            )
+            await call.message.answer('Ваша заявка принята. Техническая служба и арендодатель уведомлены')
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).error(f'Не удалось отправить уведомление администратору (chat_id={id_admin}): {e}')
+            await call.message.answer('Ваша заявка принята, но уведомить администратора не удалось. Пожалуйста, сообщите об этом напрямую.')
         
         await state.set_state(Auth_States.menu_state)
-        await call.message.answer('Вы в меню', reply_markup=get_menu_keyboard())
+        await call.message.answer('Вы в меню', reply_markup=await build_menu_keyboard(call.from_user.id))
     elif data == 'go_menu_cb':
-        from handlers.run import get_menu_keyboard
         await state.set_state(Auth_States.menu_state)
-        await call.message.answer('Вы в меню', reply_markup=get_menu_keyboard())
+        await call.message.answer('Вы в меню', reply_markup=await build_menu_keyboard(call.from_user.id))
     elif data == 'yes_termination_cb':
         await state.set_state(NotificationsStates.Notify_of_termination_State)
         await call.message.answer(''''Пожалуйста напишите причину расторжения "В связи ..."''')
@@ -188,7 +196,7 @@ async def get_docs(msg: Message, state:FSMContext):
 async def get_notify_of_termination_info(message: types.Message, state: FSMContext):
     from main import bot
     from states.auth_states import Auth_States
-    from handlers.run import get_menu_keyboard,get_info_business
+    from handlers.run import build_menu_keyboard, get_info_business
     from handlers.config import config
     id_us = message.chat.id
     records_list = await get_info_business(id_us)
@@ -211,4 +219,4 @@ async def get_notify_of_termination_info(message: types.Message, state: FSMConte
     await bot.send_document(chat_id=chat_id, document=document, caption='[РАСТОРЖЕНИЕ] Уведомление от арендатора', reply_markup=keyboard)
     # await bot.send_message(chat_id=chat_id, text=text,reply_markup=keyboard)
     await state.set_state(Auth_States.menu_state)
-    await message.answer('Вы в меню', reply_markup=get_menu_keyboard())
+    await message.answer('Вы в меню', reply_markup=await build_menu_keyboard(id_us))

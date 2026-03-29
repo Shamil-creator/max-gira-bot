@@ -1,5 +1,7 @@
 from datetime import datetime
+import json
 import tempfile
+from html import escape
 from docx import Document
 from aiogram import Bot, types, Router
 from aiogram.types import Message, CallbackQuery,MessageEntity
@@ -25,6 +27,129 @@ from states.auth_states import Auth_States
 from handlers.images_cache import image_cache
 
 _image_cache = None
+
+_TYPE_ABBR = {
+    'Холодная вода': 'ХВС',
+    'Горячая вода': 'ГВС',
+    'Электричество': 'ЭС',
+}
+
+def _norm_meter_key(x) -> str:
+    if x is None:
+        return ''
+    return str(x).strip()
+
+
+def _mr_storage_key(business_id: int) -> str:
+    return f"mr_submissions:{datetime.now().strftime('%Y-%m')}:biz:{int(business_id)}"
+
+
+async def _load_mr_month_submissions(draft_store, business_id: int) -> dict[str, str]:
+    raw = await draft_store.get(_mr_storage_key(business_id))
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict[str, str] = {}
+    for k, v in data.items():
+        nk = _norm_meter_key(k)
+        if nk and v is not None and str(v).strip() != '':
+            out[nk] = str(v).strip()
+    return out
+
+
+async def _merge_persist_mr_month_submissions(draft_store, business_id: int, submitted_readings: dict) -> None:
+    stored = await _load_mr_month_submissions(draft_store, business_id)
+    for k, v in submitted_readings.items():
+        nk = _norm_meter_key(k)
+        if not nk or nk == '—':
+            continue
+        val = v.get('value') if isinstance(v, dict) else v
+        if val is not None and str(val).strip() != '':
+            stored[nk] = str(val).strip()
+    await draft_store.set(_mr_storage_key(business_id), json.dumps(stored, ensure_ascii=False))
+
+
+async def notify_admin_readings(id_us, submitted_readings: dict):
+    """Сводка по всем компаниям со счётчиками: ✅ есть показание в текущем месяце, ❌ нет."""
+    try:
+        from main import bot
+        from main import redis as draft_store
+        from handlers.config import config
+        from handlers.admin_chat import send_to_admin_chat
+        chat_id = int(config.chanel_id.get_secret_value())
+
+        bid_rows = await get_data('SELECT id_business FROM users WHERE User_Id = $1', str(id_us))
+        business_id = bid_rows[0]['id_business'] if bid_rows and len(bid_rows) > 0 else None
+
+        if business_id is not None and submitted_readings:
+            await _merge_persist_mr_month_submissions(draft_store, business_id, submitted_readings)
+
+        all_biz = await get_data(
+            'SELECT DISTINCT b.id, b.name_company FROM bussines b '
+            'INNER JOIN us_readings ur ON ur.business_id = b.id '
+            'ORDER BY b.name_company NULLS LAST, b.id'
+        )
+        if all_biz is None:
+            all_biz = []
+
+        blocks: list[str] = []
+        for row in all_biz:
+            bid = row['id']
+            cname = row['name_company'] if row['name_company'] is not None else 'Без названия'
+            stored = await _load_mr_month_submissions(draft_store, bid)
+            meters = await get_data(
+                'SELECT ur.number_counter, tc.name FROM us_readings ur '
+                'JOIN type_counter tc ON ur.counter_type_id = tc.id '
+                'WHERE ur.business_id = $1 ORDER BY tc.id',
+                int(bid),
+            )
+            if meters is None or not meters:
+                continue
+            lines = [f"<b>{escape(str(cname))}</b> подал показания:"]
+            for meter in meters:
+                number = meter['number_counter']
+                abbr = _TYPE_ABBR.get(meter['name'], meter['name'])
+                nk = _norm_meter_key(number)
+                val = stored.get(nk)
+                if val:
+                    lines.append(f"✅{escape(abbr)} - {escape(str(number))}: {escape(str(val))}")
+                else:
+                    lines.append(f"❌{escape(abbr)} - {escape(str(number))}:")
+            blocks.append('\n'.join(lines))
+
+        if not blocks:
+            company_name = 'Неизвестно'
+            if bid_rows and business_id is not None:
+                cr = await get_data(
+                    'SELECT b.name_company FROM bussines b WHERE b.id = $1',
+                    int(business_id),
+                )
+                if cr:
+                    company_name = cr[0]['name_company'] or company_name
+            blocks.append(f"<b>{escape(str(company_name))}</b> подал показания:\n(нет счётчиков в БД)")
+
+        max_body = 3800
+        chunk: list[str] = []
+        size = 0
+        for block in blocks:
+            add = len(block) + (2 if chunk else 0)
+            if chunk and size + add > max_body:
+                await send_to_admin_chat(bot, chat_id, 'DOCS', '\n\n'.join(chunk), parse_mode='HTML')
+                chunk = []
+                size = 0
+            if chunk:
+                size += 2
+            chunk.append(block)
+            size += len(block)
+        if chunk:
+            await send_to_admin_chat(bot, chat_id, 'DOCS', '\n\n'.join(chunk), parse_mode='HTML')
+    except Exception as e:
+        print(f"Ошибка отправки уведомления админу: {e}")
 
 def smart_keyboard_hot_cold_w_mr(all_mr):
     buttons_row = []
@@ -55,14 +180,17 @@ async def get_water_image():
     return _image_cache
 
 async def get_data(query: str, *params):
+    conn = None
     try:
         conn = await asyncpg.connect(config.db_connection)
-        result = await conn.fetch(query,*params)
-        await conn.close()
-        return result
-    except Exception as e: 
+        return await conn.fetch(query, *params)
+    except Exception as e:
         print(f"Ошибка: {e}")
         return None
+    finally:
+        if conn:
+            await conn.close()
+
     
 meter_readings_router = Router()
 
@@ -123,6 +251,16 @@ def create_dynamic_keyboard(all_mr_us, type_id):
     
     keyboard = types.InlineKeyboardMarkup(inline_keyboard=inline_keyboard)
     return keyboard
+
+def _bold_meter_html(s) -> str:
+    return f"<b>{escape(str(s))}</b>"
+
+def _meter_number_from_mr_enter_callback(data: str) -> str:
+    """Номер счётчика из callback вида mr_enter_{cw|hw|el}_{number} (number может содержать _)."""
+    parts = data.split('_')
+    if len(parts) >= 4 and parts[0] == 'mr' and parts[1] == 'enter' and parts[2] in ('cw', 'hw', 'el'):
+        return '_'.join(parts[3:])
+    return data[12:] if len(data) > 12 else ''
 
 def hot_or_cold_keyboard():
     buttons = [
@@ -199,19 +337,28 @@ async def callback(call: CallbackQuery, state: FSMContext):
     #     await call.message.answer("⚠️ Файл water.png не найден в папке images/")
     #     return
     # image_water = FSInputFile(path='images/water.png')
-    number = data[12:]
+    number = _meter_number_from_mr_enter_callback(data)
     await call.message.delete()
     if this_mr_type == 'cw':
-        await call.message.answer_photo(photo=image_water, caption=f'Введите показания счетчика ХОЛОДНОЙ воды под номером - {number}. Введите значение состоящее из 5 цифр')
+        await call.message.answer_photo(
+            photo=image_water,
+            caption=f'Введите показания счетчика ХОЛОДНОЙ воды под номером — {_bold_meter_html(number)}. Введите значение состоящее из 5 цифр',
+            parse_mode='HTML',
+        )
         await state.set_state(Meter_Readings_States.enter_cold_water)
     elif this_mr_type == 'hw':
-        await call.message.answer_photo(photo=image_water, caption=f'Введите показания счетчика ГОРЯЧЕЙ воды под номером - {number}. Введите значение состоящее из 5 цифр')
+        await call.message.answer_photo(
+            photo=image_water,
+            caption=f'Введите показания счетчика ГОРЯЧЕЙ воды под номером — {_bold_meter_html(number)}. Введите значение состоящее из 5 цифр',
+            parse_mode='HTML',
+        )
         await state.set_state(Meter_Readings_States.enter_hot_water)
     elif this_mr_type == 'el':
         await state.set_state(Meter_Readings_States.enter_electricity)
         await call.message.answer_photo(
             photo=image_electricity,
-            caption="Введите показания счетчика электричества. Введите значение состоящее из 6 цифр"
+            caption=f'Введите показания счетчика электричества под номером — {_bold_meter_html(number)}. Введите значение состоящее из 6 цифр',
+            parse_mode='HTML',
         )
     await state.update_data(selected_mr = number)
 
@@ -244,8 +391,15 @@ async def callback(call: CallbackQuery, state: FSMContext):
             keyboard = create_dynamic_keyboard(all_mr, type_id)
             await call.message.answer('Выберите номер счетчика',reply_markup=keyboard)
         elif count == 1:
+            one_mr = await check_mr_for_user_in_db(id_us, type_id)
+            single_no = one_mr[0] if one_mr else ''
+            await state.update_data(selected_mr=single_no)
             await state.set_state(Meter_Readings_States.one_cold_water_readings_state)
-            await call.message.answer_photo(photo=image_water, caption="Введите показания счетчика ХОЛОДНОЙ воды. Введите значение состоящее из 5 цифр")
+            await call.message.answer_photo(
+                photo=image_water,
+                caption=f'Введите показания счетчика ХОЛОДНОЙ воды под номером — {_bold_meter_html(single_no)}. Введите значение состоящее из 5 цифр',
+                parse_mode='HTML',
+            )
         elif count < 1:
             await state.set_state(Meter_Readings_States.add_new_cold_water_readings)
             await call.message.answer('Введите номер счетчика ХОЛОДНОЙ воды')
@@ -266,8 +420,15 @@ async def callback(call: CallbackQuery, state: FSMContext):
             keyboard = create_dynamic_keyboard(all_mr, type_id)
             await call.message.answer('Выберите номер счетчика',reply_markup=keyboard)
         elif count == 1:
+            one_mr = await check_mr_for_user_in_db(id_us, type_id)
+            single_no = one_mr[0] if one_mr else ''
+            await state.update_data(selected_mr=single_no)
             await state.set_state(Meter_Readings_States.one_hot_water_readings_state)
-            await call.message.answer_photo(photo=image_water, caption="Введите показания счетчика ГОРЯЧЕЙ воды. Введите значение состоящее из 5 цифр")
+            await call.message.answer_photo(
+                photo=image_water,
+                caption=f'Введите показания счетчика ГОРЯЧЕЙ воды под номером — {_bold_meter_html(single_no)}. Введите значение состоящее из 5 цифр',
+                parse_mode='HTML',
+            )
         elif count < 1:
             await state.set_state(Meter_Readings_States.add_new_hot_water_readings)
             await call.message.answer('Введите номер счетчика ГОРЯЧЕЙ воды')
@@ -284,7 +445,7 @@ async def msg(message: Message, state: FSMContext):
 @meter_readings_router.callback_query(F.data.in_(['enter_electricity_cb','enter_water_cb','gb_in_enter_mr', 'go_menu_gmr']))
 async def cb(call: CallbackQuery, state: FSMContext):
     from main import redis as r
-    from handlers.run import get_menu_keyboard
+    from handlers.run import build_menu_keyboard
     data = call.data
     await call.message.delete()
     us_data = await state.get_data()
@@ -320,10 +481,14 @@ async def cb(call: CallbackQuery, state: FSMContext):
             keyboard = create_dynamic_keyboard(all_mr, type_id)
             await call.message.answer('Выберите номер счетчика',reply_markup=keyboard)
         elif count == 1:
+            one_mr = await check_mr_for_user_in_db(id_us, type_id)
+            single_no = one_mr[0] if one_mr else ''
+            await state.update_data(selected_mr=single_no)
             await state.set_state(Meter_Readings_States.one_electricity_readings_state)
             await call.message.answer_photo(
                 photo=image_electricity,
-                caption="Введите показания электричества. Введите значение состоящее из 6 цифр"
+                caption=f'Введите показания электричества под номером — {_bold_meter_html(single_no)}. Введите значение состоящее из 6 цифр',
+                parse_mode='HTML',
             )
         elif count <= 0:
             await state.set_state(Meter_Readings_States.add_new_electricity_readings)
@@ -332,31 +497,37 @@ async def cb(call: CallbackQuery, state: FSMContext):
         await call.message.answer('Ждем от вас показания счетчиков, выберите, какой счетчик хотите заполнить',reply_markup=get_meter_readings_keyboard())
     elif data == 'go_menu_gmr':
         await state.set_state(Auth_States.menu_state)
-        await call.message.answer('Вы в меню', reply_markup=get_menu_keyboard())
+        await call.message.answer('Вы в меню', reply_markup=await build_menu_keyboard(id_us))
 
 @meter_readings_router.message(Meter_Readings_States.one_cold_water_readings_state)
 @meter_readings_router.message(Meter_Readings_States.one_hot_water_readings_state)
 @meter_readings_router.message(Meter_Readings_States.one_electricity_readings_state)
 async def message_elect(msg: Message, state: FSMContext):
     from main import bot
-    from handlers.run import get_menu_keyboard,smart_keyboard_mr
+    from handlers.run import build_menu_keyboard, smart_keyboard_mr
     from handlers.excel_tg_test import save_mr_result_in_excel
     current_state = await state.get_state()
     check_integer = (msg.text or "").strip()
     id_us = msg.chat.id
+    st_data = await state.get_data()
+    meter_label = st_data.get('selected_mr') or ''
+    meter_prefix = f'Счётчик №{_bold_meter_html(meter_label)}. ' if meter_label and str(meter_label) != '0' else ''
     print(f'Проверка айди пользователя перед сохранением - {id_us}')
     await bot.delete_message(chat_id=msg.chat.id, message_id=msg.message_id - 1)
     await msg.delete()
     if msg.text == 'Отмена':
         await state.set_state(Auth_States.menu_state)
-        await msg.answer('Вы в меню', reply_markup=get_menu_keyboard())
+        await msg.answer('Вы в меню', reply_markup=await build_menu_keyboard(id_us))
     else:
         if current_state == Meter_Readings_States.one_electricity_readings_state:
             if check_integer.isdigit():
                 if len(check_integer)==6:
                     sheet_name = await get_sheet_name(id_us)
                     await save_mr_result_in_excel(sheet_name,check_integer,2)
-                    await state.update_data(counter_status_el = True)
+                    submitted = st_data.get("submitted_readings", {})
+                    submitted[meter_label or "—"] = {"value": check_integer}
+                    await state.update_data(submitted_readings=submitted, counter_status_el=True)
+                    await notify_admin_readings(id_us, submitted)
                     us_data = await state.get_data()
                     btns = []
                     hw = us_data.get('counter_status_hw')
@@ -373,22 +544,28 @@ async def message_elect(msg: Message, state: FSMContext):
                         await msg.answer('Ждем от вас показания счетчиков, выберите, какой счетчик хотите заполнить',reply_markup=keyboard)
                     else:
                         await state.set_state(Auth_States.menu_state)
-                        await msg.answer('В этом месяце вы заполнили все показатели.\nВы в меню', reply_markup=get_menu_keyboard())
+                        await msg.answer('В этом месяце вы заполнили все показатели.\nВы в меню', reply_markup=await build_menu_keyboard(id_us))
                     
                     # await msg.answer('Закончили заполнения счетчиков ЭЛЕКТРИЧЕСТВА')
                     # await state.set_state(Auth_States.menu_state)
-                    # await msg.answer('Вы в меню', reply_markup=get_menu_keyboard())
+                    # await msg.answer('Вы в меню', reply_markup=await build_menu_keyboard(id_us))
                 else:
-                    await msg.answer(f'Неверный формат ввода значний Электричества. Попробуйте снова — значение должно содержать первые 6 цифр')
+                    await msg.answer(
+                        f'{meter_prefix}Неверный формат ввода значений электричества. Попробуйте снова — значение должно содержать первые 6 цифр',
+                        parse_mode='HTML',
+                    )
             else:
-                await msg.answer("Пожалуйста введите число.")
+                await msg.answer(f"{meter_prefix}Пожалуйста введите число.", parse_mode='HTML')
         elif current_state == Meter_Readings_States.one_hot_water_readings_state:
             if check_integer.isdigit():
                 if len(check_integer)==5:
                     
                     sheet_name = await get_sheet_name(id_us)
                     await save_mr_result_in_excel(sheet_name,check_integer,3)
-                    await state.update_data(counter_status_hw = True)
+                    submitted = st_data.get("submitted_readings", {})
+                    submitted[meter_label or "—"] = {"value": check_integer}
+                    await state.update_data(submitted_readings=submitted, counter_status_hw=True)
+                    await notify_admin_readings(id_us, submitted)
                     us_data = await state.get_data()
                     btns = []
                     hw = us_data.get('counter_status_hw')
@@ -405,20 +582,26 @@ async def message_elect(msg: Message, state: FSMContext):
                         await msg.answer('Ждем от вас показания счетчиков, выберите, какой счетчик хотите заполнить',reply_markup=keyboard)
                     else:
                         await state.set_state(Auth_States.menu_state)
-                        await msg.answer('В этом месяце вы заполнили все показатели.\nВы в меню', reply_markup=get_menu_keyboard())
+                        await msg.answer('В этом месяце вы заполнили все показатели.\nВы в меню', reply_markup=await build_menu_keyboard(id_us))
                     # await msg.answer('Закончили заполнения счетчиков ГОРЯЧЕЙ воды')
                     # await state.set_state(Auth_States.menu_state)
-                    # await msg.answer('Вы в меню', reply_markup=get_menu_keyboard())
+                    # await msg.answer('Вы в меню', reply_markup=await build_menu_keyboard(id_us))
                 else:
-                    await msg.answer(f'Неверный формат ввода значний Горячей Воды. Попробуйте снова — значение должно содержать первые 5 цифр')
+                    await msg.answer(
+                        f'{meter_prefix}Неверный формат ввода значений горячей воды. Попробуйте снова — значение должно содержать первые 5 цифр',
+                        parse_mode='HTML',
+                    )
             else:
-                await msg.answer("Пожалуйста введите число.")
+                await msg.answer(f"{meter_prefix}Пожалуйста введите число.", parse_mode='HTML')
         elif current_state == Meter_Readings_States.one_cold_water_readings_state:
             if check_integer.isdigit():
                 if len(check_integer)==5:
                     sheet_name = await get_sheet_name(id_us)
                     await save_mr_result_in_excel(sheet_name,check_integer,1)
-                    await state.update_data(counter_status_cw = True)
+                    submitted = st_data.get("submitted_readings", {})
+                    submitted[meter_label or "—"] = {"value": check_integer}
+                    await state.update_data(submitted_readings=submitted, counter_status_cw=True)
+                    await notify_admin_readings(id_us, submitted)
                     us_data = await state.get_data()
                     btns = []
                     hw = us_data.get('counter_status_hw')
@@ -435,15 +618,18 @@ async def message_elect(msg: Message, state: FSMContext):
                         await msg.answer('Ждем от вас показания счетчиков, выберите, какой счетчик хотите заполнить',reply_markup=keyboard)
                     else:
                         await state.set_state(Auth_States.menu_state)
-                        await msg.answer('В этом месяце вы заполнили все показатели.\nВы в меню', reply_markup=get_menu_keyboard())
+                        await msg.answer('В этом месяце вы заполнили все показатели.\nВы в меню', reply_markup=await build_menu_keyboard(id_us))
                     
                     # await msg.answer('Закончили заполнения счетчиков ХОЛОДНОЙ воды')
                     # await state.set_state(Auth_States.menu_state)
-                    # await msg.answer('Вы в меню', reply_markup=get_menu_keyboard())
+                    # await msg.answer('Вы в меню', reply_markup=await build_menu_keyboard(id_us))
                 else:
-                    await msg.answer(f'Неверный формат ввода значний Холодной Воды. Попробуйте снова — значение должно содержать первые 5 цифр')
+                    await msg.answer(
+                        f'{meter_prefix}Неверный формат ввода значений холодной воды. Попробуйте снова — значение должно содержать первые 5 цифр',
+                        parse_mode='HTML',
+                    )
             else:
-                await msg.answer("Пожалуйста введите число.")
+                await msg.answer(f"{meter_prefix}Пожалуйста введите число.", parse_mode='HTML')
         
 @meter_readings_router.message(Meter_Readings_States.water_readings_state)
 async def message_elect(msg: Message, state: FSMContext):
@@ -476,11 +662,12 @@ async def mess(msg: Message, state: FSMContext):
     from handlers.excel_tg_test import save_mr_result_in_excel
     from states.auth_states import Auth_States
     from main import bot,redis as r 
-    from handlers.run import get_menu_keyboard
+    from handlers.run import build_menu_keyboard
     check_integer = msg.text
     this_state = await state.get_state()
     this_data = await state.get_data()
-    this_number = this_data['selected_mr']
+    this_number = this_data.get('selected_mr', 0)
+    mr_prefix = f'Счётчик №{_bold_meter_html(this_number)}. ' if this_number and str(this_number) != '0' else ''
     id_us = msg.chat.id
     await msg.delete()
     await bot.delete_message(chat_id=msg.chat.id, message_id=msg.message_id - 1)
@@ -498,10 +685,17 @@ async def mess(msg: Message, state: FSMContext):
                     key = f"user:{id_us}:list_hot_water"
                     all_mr = await r.lrange(key, 0, -1)
                     print(f'До очистки список - {all_mr}')
-                    await msg.answer(f'Ваши показатели на счетчик №{this_number} - {check_integer} куб.метров')
+                    await msg.answer(
+                        f'Ваши показатели на счетчик №{_bold_meter_html(this_number)} — {escape(str(check_integer))} куб.метров',
+                        parse_mode='HTML',
+                    )
                     await r.lrem(key,count=0, value = this_number)
                     all_mr = await r.lrange(key, 0, -1)
                     await state.update_data(selected_mr = 0)
+                    submitted = this_data.get("submitted_readings", {})
+                    submitted[this_number] = {"value": check_integer}
+                    await state.update_data(submitted_readings=submitted)
+                    await notify_admin_readings(id_us, submitted)
                     if len(all_mr) == 0:
                         mr_data = await state.get_data()
                         sum = mr_data['sum_mr_hw']
@@ -511,14 +705,17 @@ async def mess(msg: Message, state: FSMContext):
                         await state.update_data(counter_status_hw = True)
                         await msg.answer('Закончили заполнения счетчиков ГОРЯЧЕЙ воды')
                         await state.set_state(Auth_States.menu_state)
-                        await msg.answer('Вы в меню', reply_markup=get_menu_keyboard())
+                        await msg.answer('Вы в меню', reply_markup=await build_menu_keyboard(id_us))
                     else:
                         keyboard = create_dynamic_keyboard(all_mr, type_id)
                         await msg.answer('Выберите номер счетчика',reply_markup=keyboard)
             else:
-                await msg.answer(f'Пожалуйста введите 5 цифр')
+                await msg.answer(f'{mr_prefix}Пожалуйста введите 5 цифр', parse_mode='HTML')
         else:
-            await msg.answer("""Пожалуйста введите число. Eсли хотите вернуться назад, нажмите кнопку 'Отмена'""")
+            await msg.answer(
+                f"""{mr_prefix}Пожалуйста введите число. Если хотите вернуться назад, нажмите кнопку 'Отмена'""",
+                parse_mode='HTML',
+            )
     elif this_state == Meter_Readings_States.enter_electricity:
         if check_integer.isdigit():
             if len(check_integer)==6:
@@ -533,10 +730,17 @@ async def mess(msg: Message, state: FSMContext):
                     key = f"user:{id_us}:list_electricity"
                     all_mr = await r.lrange(key, 0, -1)
                     print(f'До очистки список - {all_mr}')
-                    await msg.answer(f'Ваши показатели на счетчик №{this_number} - {check_integer} куб.метров')
+                    await msg.answer(
+                        f'Ваши показатели на счетчик №{_bold_meter_html(this_number)} — {escape(str(check_integer))} куб.метров',
+                        parse_mode='HTML',
+                    )
                     await r.lrem(key,count=0, value = this_number)
                     all_mr = await r.lrange(key, 0, -1)
                     await state.update_data(selected_mr = 0)
+                    submitted = this_data.get("submitted_readings", {})
+                    submitted[this_number] = {"value": check_integer}
+                    await state.update_data(submitted_readings=submitted)
+                    await notify_admin_readings(id_us, submitted)
                     if len(all_mr) == 0:
                         mr_data = await state.get_data()
                         sum = mr_data['sum_mr_el']
@@ -546,14 +750,17 @@ async def mess(msg: Message, state: FSMContext):
                         await state.update_data(counter_status_el = True)
                         await msg.answer('Закончили заполнения счетчиков ЭЛЕКТРИЧЕСТВА')
                         await state.set_state(Auth_States.menu_state)
-                        await msg.answer('Вы в меню', reply_markup=get_menu_keyboard())
+                        await msg.answer('Вы в меню', reply_markup=await build_menu_keyboard(id_us))
                     else:
                         keyboard = create_dynamic_keyboard(all_mr, type_id)
                         await msg.answer('Выберите номер счетчика',reply_markup=keyboard)
             else:
-                await msg.answer(f'Пожалуйста введите 6 цифр')
+                await msg.answer(f'{mr_prefix}Пожалуйста введите 6 цифр', parse_mode='HTML')
         else:
-            await msg.answer("""Пожалуйста введите число. Eсли хотите вернуться назад, нажмите кнопку 'Отмена'""")
+            await msg.answer(
+                f"""{mr_prefix}Пожалуйста введите число. Если хотите вернуться назад, нажмите кнопку 'Отмена'""",
+                parse_mode='HTML',
+            )
     elif this_state == Meter_Readings_States.enter_cold_water:
         if check_integer.isdigit():
             if len(check_integer)==5:
@@ -569,10 +776,17 @@ async def mess(msg: Message, state: FSMContext):
                     await state.update_data(sum_mr_сw = now_sum)
                     all_mr = await r.lrange(key, 0, -1)
                     print(f'До очистки список - {all_mr}')
-                    await msg.answer(f'Ваши показатели на счетчик №{this_number} - {check_integer} куб.метров')
+                    await msg.answer(
+                        f'Ваши показатели на счетчик №{_bold_meter_html(this_number)} — {escape(str(check_integer))} куб.метров',
+                        parse_mode='HTML',
+                    )
                     await r.lrem(key,count=0, value = this_number)
                     all_mr = await r.lrange(key, 0, -1)
                     await state.update_data(selected_mr = 0)
+                    submitted = this_data.get("submitted_readings", {})
+                    submitted[this_number] = {"value": check_integer}
+                    await state.update_data(submitted_readings=submitted)
+                    await notify_admin_readings(id_us, submitted)
                     if len(all_mr) == 0:
                         mr_data = await state.get_data()
                         sum = mr_data['sum_mr_сw']
@@ -582,11 +796,14 @@ async def mess(msg: Message, state: FSMContext):
                         await state.update_data(counter_status_cw = True)
                         await msg.answer('Закончили заполнения счетчиков ХОЛОДНОЙ воды')
                         await state.set_state(Auth_States.menu_state)
-                        await msg.answer('Вы в меню', reply_markup=get_menu_keyboard())
+                        await msg.answer('Вы в меню', reply_markup=await build_menu_keyboard(id_us))
                     else:
                         keyboard = create_dynamic_keyboard(all_mr, type_id)
                         await msg.answer('Выберите номер счетчика',reply_markup=keyboard)
             else:
-                await msg.answer(f'Пожалуйста введите 5 цифр')
+                await msg.answer(f'{mr_prefix}Пожалуйста введите 5 цифр', parse_mode='HTML')
         else:
-            await msg.answer("""Пожалуйста введите число. Eсли хотите вернуться назад, нажмите кнопку 'Отмена'""")
+            await msg.answer(
+                f"""{mr_prefix}Пожалуйста введите число. Если хотите вернуться назад, нажмите кнопку 'Отмена'""",
+                parse_mode='HTML',
+            )

@@ -42,14 +42,14 @@ async def callback_query(call: CallbackQuery, state:FSMContext):
     from main import bot
     from handlers.config import config
     id_admin = config.chanel_id.get_secret_value()
-    from handlers.run import get_menu_keyboard
+    from handlers.run import build_menu_keyboard
     data = call.data
     us_data = await state.get_data()
     file_id = us_data.get('file_id')
     await call.message.delete()
     if data == 'dont_send_rw_cb':
         await state.set_state(Auth_States.menu_state)
-        await call.message.answer('Вы в меню', reply_markup=get_menu_keyboard())
+        await call.message.answer('Вы в меню', reply_markup=await build_menu_keyboard(call.from_user.id))
     elif data == 'send_rw_cb':
         await bot.send_document(
             chat_id=id_admin,

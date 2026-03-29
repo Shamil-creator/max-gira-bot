@@ -39,6 +39,19 @@ class AdminState(StatesGroup):
     entering_cold_water = State()  # Ввод холодной воды
     entering_hot_water = State()   # Ввод горячей воды
     entering_electricity = State()  # Ввод электроэнергии
-    waiting_for_unexpected = State()
     waiting_for_documents_unexpected = State()
     confirming_documents_unexpected = State()
+    waiting_for_unexpected_individual = State()
+    waiting_for_expl_individual = State()
+    editing_meters = State()
+    adding_meter_number = State()
+    editing_meter_number = State()
+    viewing_bills = State()
+    selecting_bill_company = State()
+
+    user_detail = State()
+    edit_user_param = State()
+    selecting_user_company = State()
+
+    rip_id_list = State()
+    rip_id_confirm = State()

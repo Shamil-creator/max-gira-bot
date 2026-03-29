@@ -18,26 +18,32 @@ MAX_METER_LENGTH = 25
 temp_meter_data = {}
 
 async def new_data_insert(query: str, *params):
+    conn = None
     try:
         conn = await asyncpg.connect(config.db_connection)
-        result = await conn.execute(query,*params)
-        return result
+        return await conn.execute(query, *params)
     except Exception as e:
         print(f"Ошибка: {e}")
         return None
+    finally:
+        if conn:
+            await conn.close()
 
 async def new_data_insert_many(query: str, params_list: list):
     """Пакетная вставка"""
+    conn = None
     try:
         conn = await asyncpg.connect(config.db_connection)
         async with conn.transaction():
             # executemany ожидает список кортежей
             result = await conn.executemany(query, params_list)
-        await conn.close()
         return result
     except Exception as e:
         print(f"Ошибка: {e}")
         return None
+    finally:
+        if conn:
+            await conn.close()
 
 def validate_meter_number(number: str) -> bool:
     """Проверка номера счетчика"""
@@ -334,7 +340,7 @@ async def skip_meters(callback: CallbackQuery, state: FSMContext):
         parse_mode=ParseMode.HTML
     )
     
-    await state.clear()
+    await state.set_state(AdminState.company_list)
     await callback.answer("⏭ Пропущено")
 
 @admin_meter_router.callback_query(F.data == "meter_cancel")
@@ -352,5 +358,5 @@ async def cancel_meter_input(callback: CallbackQuery, state: FSMContext):
         reply_markup=await create_companies_keyboard()
     )
     
-    await state.clear()
+    await state.set_state(AdminState.company_list)
     await callback.answer("❌ Ввод отменен")

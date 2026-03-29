@@ -7,7 +7,6 @@ import logging
 from aiogram import F
 from aiogram.types.input_file import FSInputFile
 import asyncpg
-from datetime import datetime
 from handlers.add_new_water_meter_readings import hot_or_cold_keyboard
 from handlers.config import config
 from aiogram.fsm.state import State
@@ -25,16 +24,33 @@ import aiofiles
 
 
 async def get_data(query: str, *params):
+    conn = None
     try:
         conn = await asyncpg.connect(config.db_connection)
-        result = await conn.fetch(query,*params)
-        await conn.close()
-        return result
-    except Exception as e: 
+        return await conn.fetch(query, *params)
+    except Exception as e:
         print(f"Ошибка: {e}")
         return None
+    finally:
+        if conn:
+            await conn.close()
+
+
+async def _execute(query: str, *params):
+    conn = None
+    try:
+        conn = await asyncpg.connect(config.db_connection)
+        return await conn.execute(query, *params)
+    except Exception as e:
+        print(f"Ошибка: {e}")
+        return None
+    finally:
+        if conn:
+            await conn.close()
 
 run_router = Router()
+
+
 
 
 
@@ -82,14 +98,28 @@ def go_menu_btn():
     )
     return keyboard
 
-def get_menu_keyboard():
+def get_menu_keyboard(has_meters: bool = True):
     buttons = [
-        [types.KeyboardButton(text='Уведомления🛎',style="primary"),types.KeyboardButton(text='Профиль👤',style="primary",)],
-        [types.KeyboardButton(text = 'Показания счетчиков',style="primary")],[types.KeyboardButton(text='Техническая заявка',style="primary")],
-         [types.KeyboardButton(text = 'Мои счета📁',style="primary")]
+        [types.KeyboardButton(text='Уведомления🛎', style="primary"), types.KeyboardButton(text='Профиль👤', style="primary")],
     ]
-    keyboard = types.ReplyKeyboardMarkup(keyboard=buttons,resize_keyboard=True)
+    if has_meters:
+        buttons.append([types.KeyboardButton(text='Показания счетчиков', style="primary")])
+    buttons.extend([
+        [types.KeyboardButton(text='Техническая заявка', style="primary")],
+        [types.KeyboardButton(text='Мои счета📁', style="primary")],
+    ])
+    keyboard = types.ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
     return keyboard
+
+
+async def build_menu_keyboard(user_id):
+    rows = await get_data(
+        'SELECT COUNT(*) > 0 AS has_meters FROM us_readings '
+        'WHERE business_id = (SELECT id_business FROM users WHERE User_Id = $1)',
+        str(user_id),
+    )
+    has_meters = bool(rows[0]['has_meters']) if rows else False
+    return get_menu_keyboard(has_meters=has_meters)
 
 async def get_info_business(id):
     us_businesses = await get_data('SELECT toa.name, b.* FROM users u RIGHT JOIN Bussines b ON b.id = u.id_business JOIN Type_of_Activity toa ON b.id_type_of_activity = toa.id WHERE u.User_Id = $1', str(id))
@@ -133,8 +163,13 @@ async def start_message(message: types.Message, state: FSMContext):
     await state.update_data(counter_status_el = False)
     print(bool_check[0])
     if bool_check[0]:
+        current_username = message.from_user.username or ''
+        await _execute(
+            'UPDATE users SET username = $1 WHERE user_id = $2',
+            current_username, str(id),
+        )
         await state.set_state(Auth_States.menu_state)
-        await message.answer('Вы в меню', reply_markup=get_menu_keyboard())
+        await message.answer('Вы в меню', reply_markup=await build_menu_keyboard(id))
     else:
         await state.set_state(RegStates.enterINN_state)
         # keyboard = get_type_business_keyboard()
@@ -161,7 +196,7 @@ async def get_menu(message: types.Message, state:FSMContext):
                 end_date_agreement = list['end_date_agreement']
             await message.answer(f'Наименование: <b>{name}</b>\n📝Договор: <b>{agreement}</b>\nДата прекращения договора: <b>{end_date_agreement}</b>\nАкт п/п: <b>{acceptance_certificate}</b>\nЕжемесячный платеж по аренде: <b>{bid}</b>\nПлощадь: <b>{square}</b>\n\nНомера счетчиков:\n🚰  Холодная вода: <b>{str_cw}</b>\n\n🔥 Горячая вода: <b>{str_hw}</b>\n\n⚡️ Электроэнергия: <b>{str_el}</b>',parse_mode='HTML')
         await state.set_state(Auth_States.menu_state)
-        await message.answer('Вы в меню', reply_markup=get_menu_keyboard())
+        await message.answer('Вы в меню', reply_markup=await build_menu_keyboard(id_us))
         
     elif message.text == 'Техническая заявка':
         await state.set_state(Technical_States.get_problem_state)
@@ -176,7 +211,7 @@ async def get_menu(message: types.Message, state:FSMContext):
         files_list = []
         record_files_list = await get_data('SELECT file_id, file_name FROM business_documents WHERE id_business = $1 ORDER BY date_added', id_business)
         if not record_files_list:
-            await message.answer('У вас пока нет счетов, вы в меню', reply_markup=get_menu_keyboard())
+            await message.answer('У вас пока нет счетов, вы в меню', reply_markup=await build_menu_keyboard(id_us))
         else:
             await message.answer('Ваши документы👇')
             for file in record_files_list:
@@ -187,57 +222,88 @@ async def get_menu(message: types.Message, state:FSMContext):
                 except Exception as e:
                     print('Ошибка с отправкой файла')
                     await message.answer('Счет был поврежден😓')
-            await message.answer('--------------------\nВы в меню', reply_markup=get_menu_keyboard())
+            await message.answer('--------------------\nВы в меню', reply_markup=await build_menu_keyboard(id_us))
     elif message.text == 'Показания счетчиков':
+        await state.update_data(submitted_readings={})
         us_data = await state.get_data()
-        this_day = datetime.now().day
         key = f"user:{id_us}:list_hot_water"
         await r.delete(key)
-        from main import redis as r
         results = await get_data('SELECT COUNT(*) <> 0 AS check_mr, COUNT(*) FROM us_readings WHERE business_id = (SELECT id_business FROM users WHERE User_Id = $1)',str(id_us))
-        # results_hw = await get_data('SELECT COUNT(*) <> 0 AS check_mr, COUNT(*) as count_hw FROM us_readings WHERE id_us = $1, counter_type_id = 3',str(id_us))
-        # results_cw = await get_data('SELECT COUNT(*) <> 0 AS check_mr, COUNT(*) as count_cw  FROM us_readings WHERE id_us = $1, counter_type_id = 1',str(id_us))
-        # results_el = await get_data('SELECT COUNT(*) <> 0 AS check_mr, , COUNT(*) as count_el FROM us_readings WHERE id_us = $1, counter_type_id = 2',str(id_us))
+        check_mr = False
         for result in results:
             check_mr = result['check_mr']
-        # for res_hw in results_hw:
-        #     count_hw = res_hw['count_hw']
-        # for res_cw in results_cw:
-        #     count_hw = res_cw['count_cw']
-        # for res_el in results_el:
-        #     count_hw = res_el['count_el']
-        if check_mr or check_mr:
-            if this_day < 30:
-                btns = []
-                hw = us_data.get('counter_status_hw')
-                cw = us_data.get('counter_status_cw')
-                el = us_data.get('counter_status_el')
-                if (not hw or hw == False) or (not cw or cw == False):
-                    btns.append('wr')
-                if not el or el == False:
-                    btns.append('el')
-
-                keyboard = smart_keyboard_mr(btns)
-                rows_count = sum(len(row) for row in keyboard.inline_keyboard)
-                if rows_count>1:
-                    await message.answer('Ждем от вас показания счетчиков, выберите, какой счетчик хотите заполнить',reply_markup=keyboard)
-                else:
-                    await state.set_state(Auth_States.menu_state)
-                    await message.answer('В этом месяце вы заполнили все показатели.\nВы в меню', reply_markup=get_menu_keyboard())
-            else:
-                await message.answer('Заполнить показания можно только до 10 числа месяца', reply_markup=get_menu_keyboard())
-        else:
+        if not check_mr:
             await state.set_state(Auth_States.menu_state)
-            await state.set_state(Meter_Readings_States.wait_meter_readings_state)
-            
-            await message.answer('Какие показания счетчиков хотите заполнить?',reply_markup=get_new_meter_readings_keyboard())
+            await message.answer('У вас нет зарегистрированных счетчиков.\nВы в меню', reply_markup=await build_menu_keyboard(id_us))
+        else:
+            btns = []
+            hw = us_data.get('counter_status_hw')
+            cw = us_data.get('counter_status_cw')
+            el = us_data.get('counter_status_el')
+            if (not hw or hw == False) or (not cw or cw == False):
+                btns.append('wr')
+            if not el or el == False:
+                btns.append('el')
+
+            keyboard = smart_keyboard_mr(btns)
+            rows_count = sum(len(row) for row in keyboard.inline_keyboard)
+            if rows_count > 1:
+                await message.answer('Ждем от вас показания счетчиков, выберите, какой счетчик хотите заполнить', reply_markup=keyboard)
+            else:
+                await state.set_state(Auth_States.menu_state)
+                await message.answer('В этом месяце вы заполнили все показатели.\nВы в меню', reply_markup=await build_menu_keyboard(id_us))
     else:
         await message.answer('Мы не поняли, что вы хотите сказать, попробуйте ещё раз', reply_markup=go_menu_btn())
         
+@run_router.callback_query(F.data == 'submit_readings_from_reminder')
+async def submit_readings_from_reminder(call: CallbackQuery, state: FSMContext):
+    """Обработка кнопки 'Подать показания' из ежемесячного напоминания"""
+    from main import redis as r
+    id_us = call.message.chat.id
+    await call.message.delete()
+    await state.update_data(submitted_readings={})
+    us_data = await state.get_data()
+    results = await get_data(
+        'SELECT COUNT(*) <> 0 AS check_mr, COUNT(*) FROM us_readings '
+        'WHERE business_id = (SELECT id_business FROM users WHERE User_Id = $1)',
+        str(id_us)
+    )
+    check_mr = False
+    for result in results:
+        check_mr = result['check_mr']
+    if check_mr:
+        btns = []
+        hw = us_data.get('counter_status_hw')
+        cw = us_data.get('counter_status_cw')
+        el = us_data.get('counter_status_el')
+        if (not hw or hw == False) or (not cw or cw == False):
+            btns.append('wr')
+        if not el or el == False:
+            btns.append('el')
+        keyboard = smart_keyboard_mr(btns)
+        rows_count = sum(len(row) for row in keyboard.inline_keyboard)
+        if rows_count > 1:
+            await call.message.answer(
+                'Выберите, какой счетчик хотите заполнить',
+                reply_markup=keyboard
+            )
+        else:
+            await state.set_state(Auth_States.menu_state)
+            await call.message.answer(
+                'В этом месяце вы заполнили все показатели.\nВы в меню',
+                reply_markup=await build_menu_keyboard(id_us)
+            )
+    else:
+        await state.set_state(Auth_States.menu_state)
+        await call.message.answer(
+            'У вас нет зарегистрированных счетчиков',
+            reply_markup=await build_menu_keyboard(id_us)
+        )
+
 @run_router.callback_query(F.data.in_(['enter_new_el_cb','enter_new_water_cb','cancel_menu_cb', 'go_menu_new_gmr']))
 async def cb(call: CallbackQuery, state: FSMContext):
     data = call.data
-    id_us = call.from_user.id
+    id_us = call.message.chat.id
     await call.message.delete()
     if data == 'enter_new_el_cb':
         await state.set_state(Meter_Readings_States.add_new_electricity_readings)
@@ -247,8 +313,8 @@ async def cb(call: CallbackQuery, state: FSMContext):
         await call.message.answer('Пожалуйста выберите какие счетчики хотите заполнить',reply_markup=hot_or_cold_keyboard())
     elif data == 'cancel_menu_cb':
         await state.set_state(Auth_States.menu_state)
-        await call.message.answer('Вы в меню', reply_markup=get_menu_keyboard())
+        await call.message.answer('Вы в меню', reply_markup=await build_menu_keyboard(id_us))
     elif data == 'go_menu_new_gmr':
         await state.set_state(Auth_States.menu_state)
-        await call.message.answer('Вы в меню', reply_markup=get_menu_keyboard())
+        await call.message.answer('Вы в меню', reply_markup=await build_menu_keyboard(id_us))
         

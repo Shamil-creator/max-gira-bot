@@ -22,23 +22,28 @@ from states.registation_states import RegStates
 reg_router = Router()
 
 async def get_data(query: str, *params):
+    conn = None
     try:
         conn = await asyncpg.connect(config.db_connection)
-        result = await conn.fetch(query,*params)
-        await conn.close()
-        return result
-    except Exception as e: 
-        print(f"Ошибка: {e}")
-        return None
-    
-async def new_data_insert(query: str, *params):
-    try:
-        conn = await asyncpg.connect(config.db_connection)
-        result = await conn.execute(query,*params)
-        return result
+        return await conn.fetch(query, *params)
     except Exception as e:
         print(f"Ошибка: {e}")
         return None
+    finally:
+        if conn:
+            await conn.close()
+
+async def new_data_insert(query: str, *params):
+    conn = None
+    try:
+        conn = await asyncpg.connect(config.db_connection)
+        return await conn.execute(query, *params)
+    except Exception as e:
+        print(f"Ошибка: {e}")
+        return None
+    finally:
+        if conn:
+            await conn.close()
 
 async def get_usname(id):
     from main import bot
@@ -176,7 +181,7 @@ async def Check_INN(message: Message, state: FSMContext):
         await message.delete()
     except:
         pass
-    from handlers.run import get_menu_keyboard,check_mr_for_user_in_db
+    from handlers.run import build_menu_keyboard, check_mr_for_user_in_db
     from main import redis as r
     inn_text = message.text
     id = message.chat.id
@@ -184,18 +189,8 @@ async def Check_INN(message: Message, state: FSMContext):
     if check:
         await get_business_info(inn_text,id)
         
-        key = f"user:{id}:meters"
-        meters = ['hw', 'cw', 'el']
-        meters_str = ','.join(meters)
-        await r.set(key, meters_str)
-        keyboard = await smart_add_keyboard(id)
-        print(f"Пользователь {id} зарегистрирован. Счетчики: {meters}")
-        status = await check_mr_for_user_in_db(id)
-        if status == True:
-            await state.set_state(Auth_States.menu_state)
-            await message.answer('Вы в меню', reply_markup=get_menu_keyboard())
-        else:
-            await message.answer('Нашли Вас, заполните номера ваших счетчиков пожалуйста', reply_markup=keyboard)
+        await state.set_state(Auth_States.menu_state)
+        await message.answer('Вы в меню', reply_markup=await build_menu_keyboard(id))
         
     else:
         await message.answer('Не нашли вашу компанию, проверьте пожалуйста название и снова введите данные')
@@ -231,7 +226,7 @@ async def third_ask(message: types.Message, state: FSMContext):
         await message.delete()
     except:
         pass
-    from handlers.run import get_menu_keyboard
+    from handlers.run import build_menu_keyboard
     sfp = message.text
     id = message.chat.id
     second_name = sfp.split(' ')[0]
@@ -251,7 +246,7 @@ async def third_ask(message: types.Message, state: FSMContext):
     new_bisness_id_list =  [new_id['id'] for new_id in new_obj]
     new_bisness_id = int(new_bisness_id_list[0])
     await new_data_insert('INSERT INTO Users(User_Id,First_Name,Second_Name,Patronymic,Id_Business) VALUES ($1,$2,$3,$4,$5)',str(id),first_name,second_name,patronymic,new_bisness_id)
-    await message.answer('Вы в меню', reply_markup=get_menu_keyboard())
+    await message.answer('Вы в меню', reply_markup=await build_menu_keyboard(id))
 
 @reg_router.callback_query(F.data.in_(['type_1_cb','type_2_cb','type_3_cb','type_4_cb','type_5_cb','type_6_cb','type_7_cb']))
 async def set_form_business(call: types.CallbackQuery, state: FSMContext):

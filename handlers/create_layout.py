@@ -1,13 +1,194 @@
-import pandas as pd
-import openpyxl
-from openpyxl import load_workbook
-from openpyxl.styles import Alignment, Font, Border
-from openpyxl.styles.borders import Side
+import zipfile
+import re as _re
+from decimal import Decimal
 from datetime import datetime, date
 import calendar
 import tempfile
 import os
-from pathlib import Path
+
+
+def _xml_escape(text: str) -> str:
+    return text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;')
+
+
+def _col_letter_to_num(letter: str) -> int:
+    result = 0
+    for ch in letter.upper():
+        result = result * 26 + (ord(ch) - ord('A') + 1)
+    return result
+
+
+def _col_num_to_letter(num: int) -> str:
+    result = ''
+    while num > 0:
+        num, rem = divmod(num - 1, 26)
+        result = chr(rem + ord('A')) + result
+    return result
+
+
+def _get_col_styles(sheet: str) -> dict:
+    col_styles = {}
+    for m in _re.finditer(r'<col\s[^>]*?min="(\d+)"[^>]*?max="(\d+)"[^>]*/>', sheet):
+        tag = m.group(0)
+        sm = _re.search(r'style="(\d+)"', tag)
+        if sm:
+            style_id = sm.group(1)
+            end_col = min(int(m.group(2)), 200)
+            for c in range(int(m.group(1)), end_col + 1):
+                col_styles[c] = style_id
+    return col_styles
+
+
+def _fill_template(template_path: str, output_path: str,
+                   cell_values: dict, new_rows: dict | None = None,
+                   extra_merges: list | None = None) -> None:
+    """
+    Заполняет xlsx-шаблон значениями.
+    Текст записывается через sharedStrings (t="s") — как в самом шаблоне.
+    styles.xml, изображения, настройки печати — побайтово без изменений.
+    """
+    with zipfile.ZipFile(template_path, 'r') as z:
+        file_map = {name: z.read(name) for name in z.namelist()}
+
+    sheet = file_map['xl/worksheets/sheet1.xml'].decode('utf-8')
+
+    ss_raw = file_map.get('xl/sharedStrings.xml', b'').decode('utf-8')
+    existing_si = _re.findall(r'<si>.*?</si>', ss_raw, _re.DOTALL)
+    ss_count = len(existing_si)
+    new_si_entries: list[str] = []
+
+    def _add_string(text) -> int:
+        nonlocal ss_count
+        escaped = _xml_escape(str(text))
+        new_si_entries.append(f'<si><t>{escaped}</t></si>')
+        idx = ss_count
+        ss_count += 1
+        return idx
+
+    def _make_cell_xml(ref: str, val, s_attr: str = '') -> str:
+        if isinstance(val, (int, float, Decimal)):
+            num = int(val) if isinstance(val, Decimal) and val == int(val) else val
+            return f'<c r="{ref}"{s_attr}><v>{num}</v></c>'
+        idx = _add_string(val)
+        return f'<c r="{ref}"{s_attr} t="s"><v>{idx}</v></c>'
+
+    def _set_existing_cell(sheet: str, ref: str, val) -> str:
+        if isinstance(val, (int, float, Decimal)):
+            num = int(val) if isinstance(val, Decimal) and val == int(val) else val
+            inner = f'<v>{num}</v>'
+            t_attr = ''
+        else:
+            idx = _add_string(val)
+            inner = f'<v>{idx}</v>'
+            t_attr = ' t="s"'
+
+        pat_self = _re.compile(rf'<c r="{_re.escape(ref)}"([^>]*)/>')
+        m = pat_self.search(sheet)
+        if m:
+            attrs = _re.sub(r'\s+t="[^"]*"', '', m.group(1))
+            cell = f'<c r="{ref}"{attrs}{t_attr}>{inner}</c>'
+            return sheet[:m.start()] + cell + sheet[m.end():]
+
+        pat_full = _re.compile(rf'<c r="{_re.escape(ref)}"([^>]*)>.*?</c>')
+        m = pat_full.search(sheet)
+        if m:
+            attrs = _re.sub(r'\s+t="[^"]*"', '', m.group(1))
+            cell = f'<c r="{ref}"{attrs}{t_attr}>{inner}</c>'
+            return sheet[:m.start()] + cell + sheet[m.end():]
+
+        return sheet
+
+    col_styles = _get_col_styles(sheet)
+
+    for ref, val in cell_values.items():
+        sheet = _set_existing_cell(sheet, ref, val)
+
+    if new_rows:
+        for rn in sorted(new_rows.keys()):
+            row_pat = _re.compile(rf'<row r="{rn}"[^>]*>(.*?)</row>', _re.DOTALL)
+            rm = row_pat.search(sheet)
+            if rm:
+                for col_letter, val in sorted(new_rows[rn].items()):
+                    cell_ref = f'{col_letter}{rn}'
+                    if f'r="{cell_ref}"' in rm.group(0):
+                        sheet = _set_existing_cell(sheet, cell_ref, val)
+                    else:
+                        col_num = _col_letter_to_num(col_letter)
+                        style_id = col_styles.get(col_num)
+                        s_attr = f' s="{style_id}"' if style_id else ''
+                        insert_pos = rm.end() - len('</row>')
+                        cell_xml = _make_cell_xml(cell_ref, val, s_attr)
+                        sheet = sheet[:insert_pos] + cell_xml + sheet[insert_pos:]
+                        rm = row_pat.search(sheet)
+            else:
+                cells_xml = ''
+                for col_letter, val in sorted(new_rows[rn].items()):
+                    cell_ref = f'{col_letter}{rn}'
+                    col_num = _col_letter_to_num(col_letter)
+                    style_id = col_styles.get(col_num)
+                    s_attr = f' s="{style_id}"' if style_id else ''
+                    cells_xml += _make_cell_xml(cell_ref, val, s_attr)
+                new_row = f'<row r="{rn}">{cells_xml}</row>'
+                sheet = sheet.replace('</sheetData>', f'{new_row}</sheetData>')
+
+    if extra_merges:
+        mc_m = _re.search(r'<mergeCells count="(\d+)">', sheet)
+        if mc_m:
+            existing = set(_re.findall(r'<mergeCell ref="([^"]+)"', sheet))
+            inserts = ''
+            added = 0
+            for ref in extra_merges:
+                if ref not in existing:
+                    inserts += f'<mergeCell ref="{ref}"/>'
+                    added += 1
+            if added:
+                old_count = int(mc_m.group(1))
+                sheet = sheet.replace(
+                    '</mergeCells>',
+                    f'{inserts}</mergeCells>'
+                )
+                sheet = sheet.replace(
+                    f'<mergeCells count="{old_count}">',
+                    f'<mergeCells count="{old_count + added}">'
+                )
+
+    all_refs = _re.findall(r'<c r="([A-Z]+)(\d+)"', sheet)
+    for mm in _re.finditer(r'<mergeCell ref="([A-Z]+)(\d+):([A-Z]+)(\d+)"', sheet):
+        all_refs.append((mm.group(1), mm.group(2)))
+        all_refs.append((mm.group(3), mm.group(4)))
+    if all_refs:
+        min_row = min(int(r) for _, r in all_refs)
+        max_row = max(int(r) for _, r in all_refs)
+        min_col = min(_col_letter_to_num(c) for c, _ in all_refs)
+        max_col = max(_col_letter_to_num(c) for c, _ in all_refs)
+        new_dim = f'{_col_num_to_letter(min_col)}{min_row}:{_col_num_to_letter(max_col)}{max_row}'
+        sheet = _re.sub(r'<dimension ref="[^"]*"/>', f'<dimension ref="{new_dim}"/>', sheet)
+
+    file_map['xl/worksheets/sheet1.xml'] = sheet.encode('utf-8')
+
+    if new_si_entries and ss_raw:
+        ss_raw = ss_raw.replace('</sst>', ''.join(new_si_entries) + '</sst>')
+        sst_m = _re.search(r'<sst\s[^>]*>', ss_raw)
+        if sst_m:
+            tag = sst_m.group(0)
+            tag = _re.sub(r'count="\d+"', f'count="{ss_count}"', tag)
+            tag = _re.sub(r'uniqueCount="\d+"', f'uniqueCount="{ss_count}"', tag)
+            ss_raw = ss_raw[:sst_m.start()] + tag + ss_raw[sst_m.end():]
+        file_map['xl/sharedStrings.xml'] = ss_raw.encode('utf-8')
+    elif new_si_entries:
+        ss_new = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+            f'count="{ss_count}" uniqueCount="{ss_count}">'
+            f'{"".join(new_si_entries)}</sst>'
+        )
+        file_map['xl/sharedStrings.xml'] = ss_new.encode('utf-8')
+
+    with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as out:
+        for name, data in file_map.items():
+            out.writestr(name, data)
+
+
 
 director = 'Директор'
 start_text_in_a5_ab5 = 'Арендодатель: '
@@ -38,13 +219,13 @@ def sum_propisyu_full(summa):
     
     thousands = ["тысяча", "тысячи", "тысяч"]
     millions = ["миллион", "миллиона", "миллионов"]
+    billions = ["миллиард", "миллиарда", "миллиардов"]
     
     if isinstance(summa, str):
-        # Заменяем запятую на точку, если есть
         summa = summa.replace(',', '.')
         summa = float(summa)
     
-    rubli = int(summa)  # int от float работает нормально
+    rubli = int(summa)
     kopeyki = int(round((summa - rubli) * 100))
     
     def number_to_words(num, gender_female=False):
@@ -52,6 +233,13 @@ def sum_propisyu_full(summa):
             return "ноль"
         
         result = []
+        
+        # Миллиарды
+        bln = num // 1_000_000_000
+        if bln > 0:
+            bln_text = convert_triple(bln, False)
+            result.append(bln_text + " " + get_plural_form(bln, billions))
+            num %= 1_000_000_000
         
         # Миллионы
         mil = num // 1_000_000
@@ -167,202 +355,166 @@ def get_short_fio(fio):
     short_fio = f'{fio_split[0]} {short_name}{short_patronymic}'
     return short_fio
 
-async def create_layoat_for_user(name_company, name_company_tenant, current_date, final_price, square, agreement, full_name_tenant, act_number):
+async def create_layoat_for_user(name_company, name_company_tenant, current_date, final_price, square, agreement, full_name_tenant, act_number, tenant_director_title='Директор'):
     price_rub_cop = str(final_price).split('.')
     short_full_name_tenant = get_short_fio(full_name_tenant)
-    thin_top_border  = Border(top=Side(border_style="thin", color="000000"))
-    thin_bottom_border  = Border(bottom=Side(border_style="thin", color="000000"))
+
     if isinstance(current_date, str):
-        try:
-            # Пробуем разные форматы даты
-            for fmt in ('%d.%m.%Y', '%Y-%m-%d', '%d/%m/%Y'):
-                try:
-                    current_date = datetime.strptime(current_date, fmt)
-                    break
-                except ValueError:
-                    continue
-        except:
-            # Если ничего не подошло, используем текущую дату
-            current_date = datetime.now()
-    wb = load_workbook('docs/create_layout_us.xlsx')
-    ws = wb.active
-    
-    act_text = f'Акт №{str(act_number)} от {current_date.strftime("%d.%m.%Y")}'
-    name_file = f'Акт на оплату арендного платежа для {name_company_tenant}'
+        for fmt in ('%d.%m.%Y', '%Y-%m-%d', '%d/%m/%Y'):
+            try:
+                current_date = datetime.strptime(current_date, fmt)
+                break
+            except ValueError:
+                continue
 
-    ws.merge_cells('A3:AA3')
-    ws['A3'] = act_text
-    ws['A3'].font = Font(bold=True,size=16)
-    for row in ws['A3:AA3']:
-        for cell in row:
-            cell.border = thin_bottom_border
-
-    ws.merge_cells('A5:AB5')
-    ws['A5']= f'{start_text_in_a5_ab5} {name_company}'
-    ws['A5'].alignment = Alignment(horizontal='left',vertical='center')
-    ws['A5'].font = Font(bold=True)
-    
-     
-    ws.merge_cells('A7:AB7')
-    ws['A7'].alignment = Alignment(horizontal='left',vertical='center')
-    ws['A7'] = f'{start_text_in_a7_ab7} {name_company_tenant}'
-    ws['A7'].font = Font(bold=True)
-
+    act_text = f'Акт №{act_number} от {current_date.strftime("%d.%m.%Y")}'
     text_work_in_act = get_text_work_in_act(agreement, current_date)
-    ws.merge_cells('C11:S12')
-    ws['C11'] = text_work_in_act
-    ws['C11'].alignment = Alignment(horizontal='center',vertical='center')
 
+    cell_values = {
+        'C11': text_work_in_act,
+        'T11': str(square),
+        'Y11': final_price,
+    }
 
-    ws['T11'] = str(square)
-    ws.merge_cells('T11:V12')
-    ws['T11'].alignment = Alignment(horizontal='center',vertical='center')
+    new_rows = {
+        3:  {'A': act_text},
+        5:  {'A': f'{start_text_in_a5_ab5} {name_company}'},
+        7:  {'A': f'{start_text_in_a7_ab7} {name_company_tenant}'},
+        14: {'Y': final_price},
+        16: {'A': f'{start_text_in_a16_ab16} {price_rub_cop[0]} руб. {price_rub_cop[1]} коп.'},
+        17: {'A': f'({sum_propisyu_full(final_price)})'},
+        19: {'A': text_for_user_accept_data_A19_AB19},
+        21: {'A': start_text_in_a5_ab5, 'T': start_text_in_a7_ab7},
+        22: {'A': f'{director} {name_company}', 'T': f'{tenant_director_title} {name_company_tenant}'},
+        24: {'A': 'Попова Я.В.', 'T': short_full_name_tenant},
+    }
 
-    ws.merge_cells('Y11:Z12')
-    ws['Y11'] = final_price
-    ws['Y11'].alignment = Alignment(horizontal='center',vertical='center')
+    extra_merges = [
+        'A3:AA3', 'A5:AB5', 'A7:AB7',
+        'Y14:Z14', 'A16:AB16', 'A17:AA17', 'A19:AB19',
+        'A21:E21', 'T21:AB21',
+        'A22:P22', 'T22:AB22',
+        'A24:P24', 'T24:AB24',
+    ]
 
-    ws.merge_cells('Y14:Z14')
-    ws['Y14'] = final_price
-    ws['Y14'].font = Font(bold=True,size=14)
-    ws['Y14'].alignment = Alignment(horizontal='center',vertical='center')
-
-    ws.merge_cells('A16:AB16')
-    ws['A16'] = f'{start_text_in_a16_ab16} {price_rub_cop[0]} руб. {price_rub_cop[1]} коп.'
-
-    ws.merge_cells('A19:AB19')
-    ws['A19'] = text_for_user_accept_data_A19_AB19
-    ws['A19'].alignment = Alignment(horizontal='left',vertical='center')
-
-    ws.merge_cells('A21:E21')
-    ws['A21'] = start_text_in_a5_ab5
-    ws['A21'].font = Font(bold=True,size=14)
-
-    ws['T21'] = start_text_in_a7_ab7
-    ws.merge_cells('T21:AB21')
-    ws['T21'].font = Font(bold=True,size=14)
-
-    ws.merge_cells('A17:AA17')
-    ws['A17'] = f'({sum_propisyu_full(final_price)})'
-
-    ws.merge_cells('A22:P22')
-    ws['A22'] = f'{director} {name_company}'
-
-    ws.merge_cells('T22:AB22')
-    ws['T22'] = f'{director} {name_company_tenant}'
-
-    ws.merge_cells('A24:P24')
-    ws['A24'] = 'Попова Я.В.'
-    for row in ws['A24:P24']:
-        for cell in row:
-            cell.border = thin_top_border
-
-    ws.merge_cells('T24:AB24')
-    ws['T24'] = short_full_name_tenant
-    for row in ws['T24:AB24']:
-        for cell in row:
-            cell.border = thin_top_border
-    
-    # Создание временного файла
+    name_file = f'Акт на оплату арендного платежа для {name_company_tenant}'
     temp_dir = tempfile.gettempdir()
     temp_file_path = os.path.join(temp_dir, f"{name_file}_{next(tempfile._get_candidate_names())}.xlsx")
-    
-    # Сохраняем во временный файл
-    wb.save(temp_file_path)
-    
-    # Возвращаем путь к временному файлу
+
+    _fill_template('docs/create_layout_us.xlsx', temp_file_path, cell_values,
+                    new_rows=new_rows, extra_merges=extra_merges)
     return temp_file_path
 
-async def create_invoice_for_payment_for_user(act_number, full_name_company, agreement, price):
+async def create_invoice_for_payment_for_user(act_number, full_name_company, agreement, price, target_date=None):
     months_ru = {
-                1: 'январь', 2: 'февраль', 3: 'март', 4: 'апрель',
-                5: 'май', 6: 'июнь', 7: 'июль', 8: 'август',
-                9: 'сентябрь', 10: 'октябрь', 11: 'ноябрь', 12: 'декабрь'
-            }
-    today = datetime.now()
-    first_day = today.replace(day=1).strftime("%d.%m.%Y")
-    fifth_day = today.replace(day=5).strftime("%d.%m.%Y")
-    prev = datetime.now().replace(day=1)
-    period_str = f"{months_ru[prev.month]} {prev.year}"
-    thin_top_border  = Border(top=Side(border_style="thin", color="000000"))
-    thin_bottom_border  = Border(bottom=Side(border_style="thin", color="000000"))
+        1: 'январь', 2: 'февраль', 3: 'март', 4: 'апрель',
+        5: 'май', 6: 'июнь', 7: 'июль', 8: 'август',
+        9: 'сентябрь', 10: 'октябрь', 11: 'ноябрь', 12: 'декабрь'
+    }
+    if target_date is None:
+        target_date = datetime.now().replace(day=1)
+
+    first_day = target_date.replace(day=1).strftime("%d.%m.%Y")
+    fifth_day = target_date.replace(day=5).strftime("%d.%m.%Y")
+    period_str = f"{months_ru[target_date.month]} {target_date.year}"
+
     agreement_list = agreement.split(' ')
-    
-    wb = load_workbook('docs/invoice_for_payment.xlsx')
-    ws = wb.active
-    
-    act_text = f'Счет на оплату №{str(act_number)} от {first_day}'
-    cleaned = full_name_company.replace('"', '')
-    name_file = f'Счет на оплату арендного платежа для {cleaned}'
-
-    ws.merge_cells('A5:M5')
-    ws['A5'] = act_text
-    ws['A5'].font = Font(bold=True,size=16)
-    for row in ws['A5:M5']:
-        for cell in row:
-            cell.border = thin_bottom_border
-
-    ws.merge_cells('A7:M7')
-    ws['A7']= f'Покупатель: {full_name_company}'
-    ws['A7'].alignment = Alignment(horizontal='left',vertical='center')
-    ws['A7'].font = Font(bold=True)
-    
-     
-    ws.merge_cells('C9:D9')
-    ws['C9'].alignment = Alignment(horizontal='left',vertical='center')
-    
     agr_num = agreement_list[0] if len(agreement_list) > 0 else ""
     agr_date = f" от {agreement_list[1]}" if len(agreement_list) > 1 else ""
-    ws['C9'] = f'Услуги аренды за {period_str}. По договору аренды {agr_num}{agr_date}.'
-    text_length = len(ws['C9'].value)
-    estimated_width = min(text_length * 1.2, 100)  # грубая оценка
-    ws.column_dimensions['C'].width = estimated_width / 2
-    ws.column_dimensions['D'].width = estimated_width / 2
 
-    ws.merge_cells('C9:D9')
+    cell_values = {
+        'A5': f'Счет на оплату №{act_number} от {first_day}',
+        'A7': f'Покупатель: {full_name_company}',
+        'C9': f'Услуги аренды за {period_str}. По договору аренды {agr_num}{agr_date}.',
+        'I9': price,
+        'K9': price,
+        'A10': f'Оплатить до:                                                                   {fifth_day}',
+        'L11': price,
+        'A12': f'Всего наименований 1, на сумму {price} руб.',
+        'B13': f'({sum_propisyu_full(price)})',
+    }
 
-    ws.merge_cells('K9:L9')
-    ws['K9'] = price
-    ws['K9'].alignment = Alignment(horizontal='center',vertical='center')
-
-
-    ws.merge_cells('A10:M10')
-    ws['A10'] = f'Оплатить до:                                                                   {fifth_day}'
-    ws['A10'].alignment = Alignment(horizontal='left',vertical='center')
-
-
-    ws.merge_cells('L11')
-    ws['L11'] = price
-    ws['L11'].font = Font(bold=True,size=14)
-    ws['L11'].alignment = Alignment(horizontal='center',vertical='center')
-
-    ws.merge_cells('A12:E12')
-    ws['A12'] = f'Всего наименований 1, на сумму {price} руб.'
-
-    ws.merge_cells('B13:M13')
-    ws['B13'] = f'({sum_propisyu_full(price)})'
-    ws['B13'].alignment = Alignment(horizontal='left',vertical='center')
-
-    ws.merge_cells('I9:J9')
-    ws['I9'] = price
-    
-
-    # script_dir = os.path.dirname(os.path.abspath(__file__))
-    # docs_dir = os.path.join(os.path.dirname(script_dir), 'docs')
-    # os.makedirs(docs_dir, exist_ok=True)
-
-    # timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    # file_path = os.path.join(docs_dir, f"invoice_{full_name_company}_{timestamp}.xlsx")
-
-    # wb.save(file_path)
-    # print(f"✅ Счёт сохранён: {file_path}")
-    # Создание временного файла
+    cleaned = full_name_company.replace('"', '')
+    name_file = f'Счет на оплату арендного платежа для {cleaned}'
     temp_dir = tempfile.gettempdir()
     temp_file_path = os.path.join(temp_dir, f"{name_file}_{next(tempfile._get_candidate_names())}.xlsx")
-    
-    # Сохраняем во временный файл
-    wb.save(temp_file_path)
-    
-    # Возвращаем путь к временному файлу
+
+    _fill_template('docs/invoice_for_payment.xlsx', temp_file_path, cell_values)
+    return temp_file_path
+
+
+async def create_invoice_for_ku_for_user(act_number, full_name_company, agreement, price, start_period, end_period, target_date=None):
+    if target_date is None:
+        target_date = datetime.now().replace(day=1)
+
+    first_day = target_date.replace(day=1).strftime("%d.%m.%Y")
+    fifth_day = target_date.replace(day=5).strftime("%d.%m.%Y")
+
+    agreement_list = agreement.split(' ')
+    agr_num = agreement_list[0] if len(agreement_list) > 0 else ""
+    agr_date = agreement_list[1] if len(agreement_list) > 1 else ""
+
+    cell_values = {
+        'A5': f'Счет на оплату №{act_number} от {first_day}',
+        'A7': f'Покупатель: {full_name_company}',
+        'C9': (
+            f'Возмещение затрат на электроснабжение, отопление, коммунальные услуги '
+            f'по договору аренды нежилого помещения №{agr_num} от {agr_date} '
+            f'за период с {start_period} по {end_period}.'
+        ),
+        'I9': price,
+        'K9': price,
+        'A10': f'Оплатить до:                                                                   {fifth_day}',
+        'L11': price,
+        'A12': f'Всего наименований 1, на сумму {price} руб.',
+        'B13': f'({sum_propisyu_full(price)})',
+    }
+
+    cleaned = full_name_company.replace('"', '')
+    name_file = f'Счет на оплату КУ для {cleaned}'
+    temp_dir = tempfile.gettempdir()
+    temp_file_path = os.path.join(temp_dir, f"{name_file}_{next(tempfile._get_candidate_names())}.xlsx")
+
+    _fill_template('docs/invoice_for_payment.xlsx', temp_file_path, cell_values)
+    return temp_file_path
+
+
+async def create_act_payment_ku_for_user(act_number, full_name_company, agreement, price, start_period, end_period, target_date=None):
+    months_ru = {
+        1: 'январь', 2: 'февраль', 3: 'март', 4: 'апрель',
+        5: 'май', 6: 'июнь', 7: 'июль', 8: 'август',
+        9: 'сентябрь', 10: 'октябрь', 11: 'ноябрь', 12: 'декабрь'
+    }
+    if target_date is None:
+        target_date = datetime.now()
+
+    month_name = months_ru[target_date.month]
+
+    agreement_list = agreement.split(' ')
+    agr_num = agreement_list[0] if len(agreement_list) > 0 else ""
+    agr_date = agreement_list[1] if len(agreement_list) > 1 else ""
+
+    cell_values = {
+        'A5': f'Акт №{act_number} КУ {month_name} {target_date.year}',
+        'A7': f'Покупатель: {full_name_company}',
+        'C9': (
+            f'Возмещение затрат на электроснабжение, отопление, коммунальные услуги '
+            f'по договору аренды нежилого помещения №{agr_num} от {agr_date} '
+            f'за период с {start_period} по {end_period}.'
+        ),
+        'I9': price,
+        'K9': price,
+        'A10': '',
+        'L11': price,
+        'A12': f'Всего наименований 1, на сумму {price} руб.',
+        'B13': f'({sum_propisyu_full(price)})',
+    }
+
+    cleaned = full_name_company.replace('"', '')
+    name_file = f'Акт КУ для {cleaned}'
+    temp_dir = tempfile.gettempdir()
+    temp_file_path = os.path.join(temp_dir, f"{name_file}_{next(tempfile._get_candidate_names())}.xlsx")
+
+    _fill_template('docs/invoice_for_payment.xlsx', temp_file_path, cell_values)
     return temp_file_path
 

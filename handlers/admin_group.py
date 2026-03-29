@@ -31,7 +31,7 @@ temp_documents = {}
 
 file_lock = asyncio.Lock()
 
-ALL_TYPES = ["electro", "water_cold", "expl", "drainage"]
+ALL_TYPES = ["electro", "water_cold", "drainage"]
 
 # Функция для получения меток типов
 def get_type_names():
@@ -54,7 +54,7 @@ def get_type_labels():
 def service_keyboard():
     """Клавиатура выбора услуги"""
     buttons = [
-        [InlineKeyboardButton(text="🔥 Отопление", callback_data="service_heat")],
+        [InlineKeyboardButton(text="🔥 Отопление, Экс. услуги, Непредвиденные", callback_data="service_heat")],
         [InlineKeyboardButton(text="📊 Общие показатели", callback_data="service_common")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_admin_menu")]
     ]
@@ -70,18 +70,53 @@ def get_type_units():
 
 # ===== УТИЛИТЫ =====
 
+_ADMIN_RENT_ACT_RE = re.compile(r'^Акт \d{2}\.\d{4}')
+
+
+def admin_my_bills_sort_key(doc: Any) -> Tuple[int, float]:
+    """Порядок для «Мои счета»: акт КУ → акт аренды → акт расчета → счёт аренды → счёт КУ → прочее."""
+    fn = (doc.get('file_name') or '').strip()
+    da = doc.get('date_added')
+    if isinstance(da, datetime):
+        ts = da.timestamp()
+    elif isinstance(da, date):
+        ts = datetime.combine(da, datetime.min.time()).timestamp()
+    else:
+        ts = 0.0
+
+    if fn.startswith('Акт расчета КУ'):
+        cat = 1
+    elif fn.startswith('Акт КУ'):
+        cat = 1
+    elif fn.startswith('Акт №') and 'КУ' in fn:
+        cat = 1
+    elif _ADMIN_RENT_ACT_RE.match(fn):
+        cat = 2
+    elif fn.startswith('Акт расчета'):
+        cat = 3
+    elif fn.startswith('Счет на оплату аренды'):
+        cat = 4
+    elif fn.startswith('Счет на оплату КУ'):
+        cat = 5
+    else:
+        cat = 6
+    return (cat, -ts)
+
+
 async def get_data(query: str, *params):
     """Основной метод работы с БД"""
+    conn = None
     try:
         import asyncpg
         conn = await asyncpg.connect(config.db_connection)
-        result = await conn.fetch(query, *params)
-        await conn.close()
-        return result
-    except Exception as e: 
+        return await conn.fetch(query, *params)
+    except Exception as e:
         logging.error(f"Ошибка БД: {e}")
         return None
-    
+    finally:
+        if conn:
+            await conn.close()
+
 async def get_sheet_name_bs(id_comp):
     name = ''
     result_record = await get_data('SELECT sheet_name FROM bussines WHERE id = $1', id_comp)
@@ -101,6 +136,69 @@ async def new_data_insert(query: str, *params):
     finally:
         if conn:
             await conn.close()
+
+
+def validate_company_edit_field(param_key: str, new_value: str) -> Tuple[bool, str, Any]:
+    """
+    Валидация поля при редактировании компании.
+    Возвращает (успех, текст_ошибки, значение_для_БД).
+    """
+    if param_key == "name_company":
+        if len(new_value) > 50:
+            return False, "Наименование не длиннее 50 символов (ограничение БД).", None
+        return True, "", new_value
+    if param_key == "square":
+        try:
+            v = float(new_value.replace(",", "."))
+        except ValueError:
+            return False, "Площадь должна быть числом (например 100 или 150.5).", None
+        return True, "", v
+    if param_key == "bid":
+        try:
+            v = float(new_value.replace(",", "."))
+        except ValueError:
+            return False, "Ставка должна быть числом.", None
+        return True, "", v
+    if param_key == "agreement":
+        if len(new_value) > 50:
+            return False, "Номер договора не длиннее 50 символов.", None
+        return True, "", new_value
+    if param_key == "contract_end_date":
+        try:
+            datetime.strptime(new_value, "%d.%m.%Y")
+        except ValueError:
+            return False, "Дата в формате ДД.ММ.ГГГГ (например 31.12.2025).", None
+        return True, "", new_value
+    if param_key == "acceptance_certificate":
+        try:
+            d = datetime.strptime(new_value, "%d.%m.%Y").date()
+        except ValueError:
+            return False, "Дата акта в формате ДД.ММ.ГГГГ.", None
+        return True, "", d
+    if param_key == "phone":
+        return True, "", new_value
+    if param_key == "director_name":
+        parts = new_value.split()
+        if len(parts) < 3:
+            return False, "Введите полное ФИО (минимум 3 слова).", None
+        if not re.match(r"^[а-яА-ЯёЁ\s\-]+$", new_value):
+            return False, "ФИО: только кириллица, пробелы и дефисы.", None
+        return True, "", new_value
+    if param_key == "activity_type":
+        name = new_value.strip()
+        if len(name) < 2:
+            return False, "Слишком короткое название вида деятельности.", None
+        return True, "", name
+    return True, "", new_value
+
+
+async def _admin_try_delete_user_message(bot: Bot, message: Message) -> None:
+    """Удалить сообщение пользователя (работает и в личном чате, и в группе)."""
+    try:
+        await message.delete()
+    except Exception as exc:
+        logging.warning("Не удалось удалить сообщение %s в чате %s: %s", message.message_id, message.chat.id, exc)
+
 
 async def send_to_admin_topic(bot: Bot, text: str, reply_markup=None, parse_mode="Markdown"):
     """Отправить сообщение в единый админ-чат (без топиков)."""
@@ -154,6 +252,7 @@ def admin_main_keyboard():
     builder.button(text="👥 Выборочная рассылка", callback_data="admin_broadcast_select")
     builder.button(text="👤 Управление пользователями", callback_data="admin_manage_users")
     builder.button(text="📝 Подать показания", callback_data="admin_submit_readings")
+    builder.button(text="📁 Мои счета", callback_data="admin_my_bills")
     builder.button(text="🔄 Обновить",style="primary", callback_data="admin_refresh")
     builder.adjust(1)
     return builder.as_markup()
@@ -250,8 +349,7 @@ def get_edit_keyboard():
     # Кнопки для редактирования каждого типа
     builder.button(text="⚡ Редактировать электричество", callback_data="admin_edit_electro")
     builder.button(text="🚰 Редактировать холодную воду", callback_data="admin_edit_water_cold")
-    builder.button(text='💧 Редактировать тариф водоотведения', callback_data='admin_edit_drainage')
-    builder.button(text="🏢 Комм. услуги", callback_data="admin_edit_expl")
+    builder.button(text='💧 Редактировать ставку водоотведения', callback_data='admin_edit_drainage')
     
     # Кнопки действий
     builder.button(text="💾 Сохранить все показания",style="success", callback_data="admin_save_all")
@@ -266,7 +364,6 @@ def type_keyboard():
     builder.button(text="🚰 Холодная вода", callback_data="admin_type_water_cold")
     builder.button(text='💧 Водоотведение', callback_data='admin_type_drainage')
     # builder.button(text="🌡 Отопление", callback_data="admin_type_heat")
-    builder.button(text="🏢 Коммунальные услуги", callback_data="admin_type_expl")  # Добавили
     builder.button(text="🔙 Назад", callback_data="admin_to_main")
     builder.adjust(1)
     return builder.as_markup()
@@ -350,11 +447,70 @@ async def admin_login(message: Message, state: FSMContext, bot: Bot):
         pass
 
 
+@admin_router.message(Command("sendall"))
+async def admin_sendall(message: Message, bot: Bot):
+    """Рассылка всех автоматических документов и напоминаний каждому пользователю."""
+    if not await has_admin_access(message.from_user.id):
+        await message.answer("⛔ Доступ запрещен.")
+        return
+
+    admin_chat = message.chat.id
+    await message.answer("📤 Рассылка всех автоматических документов и напоминаний...")
+
+    from handlers.check_payment_status import (
+        get_invoice_msg_every_month,
+        get_act_of_payment,
+        get_act_ku_payment_every_month,
+        get_message_every_month,
+        get_mr_message_every_month,
+        get_data as cps_get_data,
+    )
+
+    all_users = await cps_get_data("SELECT user_id FROM users")
+    if not all_users:
+        await bot.send_message(admin_chat, "Нет зарегистрированных пользователей.")
+        return
+
+    user_ids = [u["user_id"] for u in all_users]
+    total = len(user_ids)
+    ok_count = 0
+    error_count = 0
+
+    tasks = [
+        ("Напоминание об оплате", get_message_every_month, False),
+        ("Напоминание о показаниях", get_mr_message_every_month, False),
+        ("Счёт на оплату аренды", get_invoice_msg_every_month, True),
+        ("Акт аренды", get_act_of_payment, True),
+        ("Акт КУ", get_act_ku_payment_every_month, True),
+    ]
+
+    for idx, uid in enumerate(user_ids, 1):
+        for label, func, has_force in tasks:
+            try:
+                if has_force:
+                    await func(uid, force=True)
+                else:
+                    await func(uid)
+                ok_count += 1
+            except Exception as e:
+                logging.exception("[sendall] %s для user %s: %s", label, uid, e)
+                error_count += 1
+        await asyncio.sleep(0.3)
+
+    await bot.send_message(
+        admin_chat,
+        f"✅ /sendall завершён.\n"
+        f"Пользователей: {total}\n"
+        f"Отправлено: {ok_count}\n"
+        f"Ошибок: {error_count}",
+    )
+
+
 # Храним собранные данные
 collected_data = {}
 unexpected_expenses = 0.0
 
-@admin_router.callback_query(F.data == "admin_submit_readings_back", StateFilter(AdminState.admin_menu))
+@admin_router.callback_query(F.data == "admin_submit_readings_back", StateFilter(AdminState.choosing_method))
 async def admin_submit_readings(call: CallbackQuery, state: FSMContext, bot: Bot):
     query = "SELECT COUNT(*) as count FROM users"
     result = await get_data(query)
@@ -404,7 +560,7 @@ async def admin_process_type(call: CallbackQuery, state: FSMContext, bot: Bot):
     elif kind == 'drainage':
         await state.update_data(state='amount')
         await state.set_state(AdminState.waiting_for_amount_drainage)
-    elif kind == 'water_cold':  # Для холодной воды - только тариф
+    elif kind == 'water_cold':  # Для холодной воды - только ставка
         await state.update_data(step="tariff")
         await state.set_state(AdminState.waiting_for_tariff)
     else:
@@ -438,7 +594,7 @@ async def admin_process_type(call: CallbackQuery, state: FSMContext, bot: Bot):
             bot,
             call.message.message_id,
             f"📊 Подача показаний {label}\n\n"
-            f"Введите тариф для {label} (в рублях за м³):\n"
+            f"Введите ставку для {label} (в рублях за м³):\n"
             f"(например: 45.50)",
             reply_markup=cancel_keyboard(),
             parse_mode="HTML"
@@ -456,7 +612,7 @@ async def admin_process_type(call: CallbackQuery, state: FSMContext, bot: Bot):
 
 @admin_router.message(StateFilter(AdminState.waiting_for_tariff))
 async def process_tariff_input(message: Message, state: FSMContext, bot: Bot):
-    """Обработка введенного тарифа для холодной воды"""
+    """Обработка введенной ставки для холодной воды"""
     try:
         await message.delete()
     except:
@@ -474,7 +630,7 @@ async def process_tariff_input(message: Message, state: FSMContext, bot: Bot):
         await send_to_admin_topic(
             bot,
             "⚠️ Ошибка ввода\n\n"
-            "Пожалуйста, введите корректный тариф (положительное число).",
+            "Пожалуйста, введите корректную ставку (положительное число).",
             reply_markup=cancel_keyboard()
         )
         return
@@ -482,7 +638,7 @@ async def process_tariff_input(message: Message, state: FSMContext, bot: Bot):
     data = await state.get_data()
     current_type = data.get("current_type")  # Должно быть "water_cold"
     
-    # Сохраняем тариф
+    # Сохраняем ставку
     global collected_data
     if current_type not in collected_data:
         collected_data[current_type] = {}
@@ -503,7 +659,6 @@ async def process_tariff_input(message: Message, state: FSMContext, bot: Bot):
     type_to_readable = {
         'electro': 'электричество',
         'water_cold': 'холодная вода',
-        'expl': 'коммунальные услуги',
         'drainage': 'водоотведение'
     }
     
@@ -527,8 +682,8 @@ async def process_tariff_input(message: Message, state: FSMContext, bot: Bot):
         bot,
         f"✅ Данные сохранены:\n\n"
         f"{label}\n"
-        f"• Тариф: {tariff} руб./м³\n\n"
-        f"Собрано показаний: {len(collected_types)} из 5\n\n"
+        f"• Ставка: {tariff} руб./м³\n\n"
+        f"Собрано показаний: {sum(1 for t in ALL_TYPES if t in collected_data)} из {len(ALL_TYPES)}\n\n"
         f"{'📋 Все показатели собраны!' if not missing_types else '📝 Осталось заполнить: ' + ', '.join(missing_types_for_users)}",
         reply_markup=builder.as_markup(),
         parse_mode="HTML"
@@ -773,7 +928,6 @@ async def process_unexpected_amount(message: Message, state: FSMContext, bot: Bo
     
     # Кнопки для дальнейших действий
     builder = InlineKeyboardBuilder()
-    builder.button(text="💰 Изменить расходы", callback_data="admin_unexpected_expenses")
     builder.button(text="📎 Прикрепить документы", callback_data="admin_attach_documents")
     builder.button(text="✅ Отправить", callback_data="admin_final_save")
     builder.button(text="❌ Отмена", callback_data="admin_cancel")
@@ -949,7 +1103,6 @@ async def cancel_unexpected_documents(call: CallbackQuery, state: FSMContext, bo
     type_to_readable = {
         'electro': 'электричество',
         'water_cold': 'холодная вода',
-        'expl': 'коммунальные услуги',
         'drainage': 'водоотведение'
     }
     
@@ -967,7 +1120,7 @@ async def cancel_unexpected_documents(call: CallbackQuery, state: FSMContext, bo
     builder.button(text="❌ Отмена", callback_data="admin_cancel")
     builder.adjust(1)
     
-    report = f"✅ Данные сохранены\n\nСобрано показаний: {len(collected_types)} из 5\n\n"
+    report = f"✅ Данные сохранены\n\nСобрано показаний: {sum(1 for t in ALL_TYPES if t in collected_data)} из {len(ALL_TYPES)}\n\n"
     if not missing_types:
         report += "📋 Все показатели собраны!\n"
     else:
@@ -1080,13 +1233,45 @@ async def proceed_with_sending_unexpected(call: CallbackQuery, state: FSMContext
             parse_mode=ParseMode.HTML
         )
 
-        # text_for_user = await get_volume_and_amount_month(user)
         file = await create_word(collected_data, user, count_users, info_list, unexpected_expenses)
         document = FSInputFile(file)
         
+        # Получаем индивидуальные суммы непредвиденных/эксплуатационных из БД
+        user_business = await get_data(
+            'SELECT id_business FROM users WHERE User_Id = $1', str(user)
+        )
+        user_unexp = 0
+        user_expl = 0
+        if user_business:
+            bid = user_business[0]['id_business']
+            # Читаем из Excel для этого пользователя (данные уже записаны add_tenant_for_user)
+            try:
+                from handlers.excel_tg_test import get_sheet_name_in_id_business
+                import pandas as pd
+                sheet = await get_sheet_name_in_id_business(bid)
+                df = pd.read_excel('docs/ГИРА_1006теккаа2.xlsx', sheet_name=sheet, header=None).fillna(0)
+                # Строка 12 = непредвиденные, строка 11 = эксплуатация (значение в последнем ненулевом столбце)
+                for c in reversed(range(len(df.columns))):
+                    try:
+                        v = float(df.iloc[11, c])
+                        if v > 0: user_unexp = v; break
+                    except: continue
+                for c in reversed(range(len(df.columns))):
+                    try:
+                        v = float(df.iloc[10, c])
+                        if v > 0: user_expl = v; break
+                    except: continue
+            except:
+                pass
+        
         caption = '🧾 Ваш счёт за прошедший месяц'
-        if unexpected_expenses > 0:
-            caption += f'\n\n💰 Непредвиденные расходы: {unexpected_expenses} руб.'
+        caption_parts = []
+        if user_unexp > 0:
+            caption_parts.append(f'💰 Непредвиденные расходы: {user_unexp:.2f} руб.')
+        if user_expl > 0:
+            caption_parts.append(f'🏢 Эксплуатационные услуги: {user_expl:.2f} руб.')
+        if caption_parts:
+            caption += '\n\n' + '\n'.join(caption_parts)
         
         await bot.send_document(
             chat_id=int(user),
@@ -1095,7 +1280,6 @@ async def proceed_with_sending_unexpected(call: CallbackQuery, state: FSMContext
         )
         os.unlink(file)
         
-        # Отправляем приложенные документы (непредвиденные расходы)
         for doc in documents:
             mime = (doc.get('mime_type') or "").lower()
             file_id = doc.get('file_id')
@@ -1164,8 +1348,10 @@ async def proceed_with_sending_unexpected(call: CallbackQuery, state: FSMContext
         report += f"{label}\n"
         
         if reading_type == 'water_cold':
-            report += f"• Тариф: {data.get('tariff', 0)} руб./м³\n\n"
-        elif reading_type in ['expl', 'drainage']:
+            report += f"• Ставка: {data.get('tariff', 0)} руб./м³\n\n"
+        elif reading_type == 'drainage':
+            report += f"• Сумма: {data['amount']} руб.\n\n"
+        elif reading_type == 'expl':
             report += f"• Сумма: {data['amount']} руб.\n\n"
         else:
             report += f"• Объем: {data['volume']}\n"
@@ -1355,7 +1541,6 @@ async def process_drainage_amount_input(message: Message, state: FSMContext, bot
         type_to_readable = {
             'electro': 'электричество',
             'water_cold': 'холодная вода',
-            'expl': 'коммунальные услуги',
             'drainage': 'водоотведение'
         }
         
@@ -1378,7 +1563,7 @@ async def process_drainage_amount_input(message: Message, state: FSMContext, bot
             f"✅ Данные сохранены:\n\n"
             f"{label}\n"
             f"• Ставка для водоотведения: {amount} руб.\n\n"
-            f"Собрано показаний: {len(collected_types)} из 5\n\n"
+            f"Собрано показаний: {sum(1 for t in ALL_TYPES if t in collected_data)} из {len(ALL_TYPES)}\n\n"
             f"{'📋 Все показатели собраны!' if not missing_types else '📝 Осталось заполнить: ' + ', '.join(missing_types_for_users)}",
             reply_markup=builder.as_markup(),
             parse_mode="HTML"
@@ -1449,7 +1634,6 @@ async def process_amount_expl_input(message: Message, state: FSMContext, bot: Bo
         type_to_readable = {
             'electro': 'электричество',
             'water_cold': 'холодная вода',
-            'expl': 'коммунальные услуги',
             'drainage': 'водоотведение'
         }
         
@@ -1472,7 +1656,7 @@ async def process_amount_expl_input(message: Message, state: FSMContext, bot: Bo
             f"✅ Данные сохранены:\n\n"
             f"{label}\n"
             f"• Сумма с НДС: {amount} руб.\n\n"
-            f"Собрано показаний: {len(collected_types)} из 5\n\n"
+            f"Собрано показаний: {sum(1 for t in ALL_TYPES if t in collected_data)} из {len(ALL_TYPES)}\n\n"
             f"{'📋 Все показатели собраны!' if not missing_types else '📝 Осталось заполнить: ' + ', '.join(missing_types_for_users)}",
             reply_markup=builder.as_markup(),
             parse_mode="HTML"
@@ -1493,13 +1677,11 @@ async def process_amount_expl_input(message: Message, state: FSMContext, bot: Bo
 @admin_router.message(StateFilter(AdminState.waiting_for_edit))
 async def process_edit_input(message: Message, state: FSMContext, bot: Bot):
     """Обработка ввода нового значения при редактировании"""
-    try:
-        await message.delete()
-    except:
-        pass
     if message.chat.id != ADMIN_CHAT_ID:
         return
-    
+    if not message.text:
+        return
+
     raw_text = message.text.replace(",", ".")
     
     try:
@@ -1507,6 +1689,7 @@ async def process_edit_input(message: Message, state: FSMContext, bot: Bot):
         if value < 0:
             raise ValueError
     except ValueError:
+        await _admin_try_delete_user_message(bot, message)
         await send_to_admin_topic(
             bot,
             "⚠️ Ошибка ввода\n\n"
@@ -1522,6 +1705,7 @@ async def process_edit_input(message: Message, state: FSMContext, bot: Bot):
     
     # Проверяем, есть ли такой тип
     if not edit_type:
+        await _admin_try_delete_user_message(bot, message)
         await send_to_admin_topic(
             bot,
             "❌ Ошибка: не указан тип показаний",
@@ -1531,6 +1715,7 @@ async def process_edit_input(message: Message, state: FSMContext, bot: Bot):
     
     # ОБНОВЛЕНИЕ: Проверка для эксплуатационных услуг
     if edit_type == "expl" and editing_field == "volume":
+        await _admin_try_delete_user_message(bot, message)
         await send_to_admin_topic(
             bot,
             "❌ Ошибка: коммунальные услуги не имеют объема\n"
@@ -1545,6 +1730,12 @@ async def process_edit_input(message: Message, state: FSMContext, bot: Bot):
         collected_data[edit_type] = {}
     
     collected_data[edit_type][editing_field] = value
+    
+    if edit_type == 'electro' and editing_field in ('volume', 'amount'):
+        vol = collected_data[edit_type].get('volume', 0)
+        amt = collected_data[edit_type].get('amount', 0)
+        if vol and vol > 0:
+            collected_data[edit_type]['tariff'] = round(float(amt) / float(vol), 6)
     
     # Показываем обновленные данные
     field_names = {
@@ -1576,7 +1767,12 @@ async def process_edit_input(message: Message, state: FSMContext, bot: Bot):
     if edit_type != "expl":
         message_text += f"• Объем: {type_data.get('volume', '—')}\n"
     
-    message_text += f"• Сумма: {type_data.get('amount', '—')} руб.\n\nЧто еще хотите изменить?"
+    message_text += f"• Сумма: {type_data.get('amount', '—')} руб.\n"
+    
+    if edit_type == 'electro' and 'tariff' in type_data:
+        message_text += f"• Ставка: {round(type_data['tariff'], 4)} руб./кВт·ч\n"
+    
+    message_text += "\nЧто еще хотите изменить?"
     
     await send_to_admin_topic(
         bot,
@@ -1584,12 +1780,7 @@ async def process_edit_input(message: Message, state: FSMContext, bot: Bot):
         reply_markup=builder.as_markup(),
         parse_mode="HTML"
     )
-    
-    # Удаляем сообщение с вводом
-    try:
-        await bot.delete_message(ADMIN_CHAT_ID, message.message_id)
-    except:
-        pass
+    await _admin_try_delete_user_message(bot, message)
 
 @admin_router.message(StateFilter(AdminState.waiting_for_volume))
 async def process_volume_input(message: Message, state: FSMContext, bot: Bot):
@@ -1703,6 +1894,11 @@ async def process_amount_input(message: Message, state: FSMContext, bot: Bot):
         
         collected_data[current_type]["amount"] = amount
         
+        if current_type == 'electro':
+            volume = collected_data[current_type].get('volume', 0)
+            if volume > 0:
+                collected_data[current_type]['tariff'] = round(amount / volume, 6)
+        
         names = {
             "electro": "⚡ Электроэнергия",
             "water_cold": "🚰 Холодная вода", 
@@ -1711,17 +1907,14 @@ async def process_amount_input(message: Message, state: FSMContext, bot: Bot):
         label = names.get(current_type, "")
         
         # Проверяем, все ли типы заполнены
-        all_types = ["electro", "water_cold", "expl","drainage"]
         collected_types = list(collected_data.keys())
         
-        missing_types = [t for t in all_types if t not in collected_types]
+        missing_types = [t for t in ALL_TYPES if t not in collected_types]
         for type_miss in missing_types:
             if type_miss == 'electro':
                 missing_types_for_users.append('электричество')
             elif type_miss == 'water_cold':
                 missing_types_for_users.append('холодная вода')
-            elif type_miss == 'expl':
-                missing_types_for_users.append('комм. услуги')
             elif type_miss == 'drainage':
                 missing_types_for_users.append('водоотведение')
         
@@ -1743,13 +1936,19 @@ async def process_amount_input(message: Message, state: FSMContext, bot: Bot):
             unit_of_measurement = "кВт·ч"
         elif label == "🚰 Холодная вода":
             unit_of_measurement = "м³"
+        
+        stavka_line = ""
+        if current_type == 'electro' and 'tariff' in collected_data.get(current_type, {}):
+            stavka_line = f"• Ставка: {round(collected_data[current_type]['tariff'], 4)} руб./кВт·ч\n"
+        
         await send_to_admin_topic(
             bot,
             f"✅ Данные сохранены:\n\n"
             f"{label}\n"
             f"• Объем: {collected_data[current_type]['volume']} {unit_of_measurement}\n"
-            f"• Сумма с НДС: {amount} руб.\n\n"
-            f"Собрано показаний: {len(collected_types)} из 5\n\n"
+            f"• Сумма с НДС: {amount} руб.\n"
+            f"{stavka_line}\n"
+            f"Собрано показаний: {sum(1 for t in ALL_TYPES if t in collected_data)} из {len(ALL_TYPES)}\n\n"
             f"{'📋 Все показатели собраны!' if not missing_types else '📝 Осталось заполнить: ' + ', '.join(missing_types_for_users)}",
             reply_markup=builder.as_markup(),
             parse_mode="HTML"
@@ -1807,11 +2006,16 @@ async def handle_edit_menu(call: CallbackQuery, state: FSMContext, bot: Bot):
             message_text = f"✏️ Редактирование показаний {label}\n\nТекущие значения:\n"
             
             if edit_type == 'water_cold':
-                message_text += f"• Тариф: {data.get('tariff', 0)} руб./м³\n\n"
+                message_text += f"• Ставка: {data.get('tariff', 0)} руб./м³\n\n"
             if edit_type != "expl" or edit_type!= "drainage":
                 message_text += f"• Объем: {type_data.get('volume', '—')}\n"
             
-            message_text += f"• Сумма: {type_data.get('amount', '—')} руб.\n\nЧто вы хотите изменить?"
+            message_text += f"• Сумма: {type_data.get('amount', '—')} руб.\n"
+            
+            if edit_type == 'electro' and 'tariff' in type_data:
+                message_text += f"• Ставка: {round(type_data['tariff'], 4)} руб./кВт·ч\n"
+            
+            message_text += "\nЧто вы хотите изменить?"
             
             await edit_admin_message(
                 bot,
@@ -1850,11 +2054,17 @@ async def show_edit_menu_from_state(call: CallbackQuery, state: FSMContext, bot:
             data = collected_data[reading_type]
             report += f"✅ {label}\n"
             if reading_type == 'water_cold':
-                report += f"• Тариф: {data.get('tariff', 0)} руб./м³\n\n"
-            elif reading_type != "expl" or reading_type != "drainage":
-                report += f"• Объем: {data.get('volume', '—')}\n"
+                report += f"• Ставка: {data.get('tariff', 0)} руб./м³\n\n"
+            elif reading_type == 'drainage':
                 report += f"• Сумма: {data.get('amount', '—')} руб.\n\n"
+            elif reading_type == 'electro':
+                report += f"• Объем: {data.get('volume', '—')}\n"
+                report += f"• Сумма: {data.get('amount', '—')} руб.\n"
+                if 'tariff' in data:
+                    report += f"• Ставка: {round(data['tariff'], 4)} руб./кВт·ч\n"
+                report += "\n"
             else:
+                report += f"• Объем: {data.get('volume', '—')}\n"
                 report += f"• Сумма: {data.get('amount', '—')} руб.\n\n"
         else:
             report += f"❌ {label} — не заполнено\n\n"
@@ -1908,10 +2118,10 @@ async def start_edit_type(call: CallbackQuery, state: FSMContext, bot: Bot):
     
     # Разные кнопки в зависимости от типа
     if edit_type == "water_cold":
-        # Для холодной воды - только тариф
-        builder.button(text="💰 Редактировать тариф", callback_data=f"admin_edit_tariff_{edit_type}")
-    elif edit_type == "expl" or edit_type == "drainage":
-        # Для эксплуатационных услуг и водоотведения - только сумма
+        # Для холодной воды - только ставка
+        builder.button(text="💰 Редактировать ставку", callback_data=f"admin_edit_tariff_{edit_type}")
+    elif edit_type == "drainage":
+        # Водоотведение — только сумма (ставка)
         builder.button(text="💰 Редактировать сумму", callback_data=f"admin_edit_amount_{edit_type}")
     else:
         # Для остальных (electro, water_hot) - объем и сумма
@@ -1927,9 +2137,15 @@ async def start_edit_type(call: CallbackQuery, state: FSMContext, bot: Bot):
     message_text = f"✏️ Редактирование показаний {label}\n\nТекущие значения:\n"
     
     if edit_type == "water_cold":
-        message_text += f"• Тариф: {type_data.get('tariff', '—')} руб./м³\n\n"
-    elif edit_type == "expl" or edit_type == "drainage":
+        message_text += f"• Ставка: {type_data.get('tariff', '—')} руб./м³\n\n"
+    elif edit_type == "drainage":
         message_text += f"• Сумма: {type_data.get('amount', '—')} руб.\n\n"
+    elif edit_type == "electro":
+        message_text += f"• Объем: {type_data.get('volume', '—')}\n"
+        message_text += f"• Сумма: {type_data.get('amount', '—')} руб.\n"
+        if 'tariff' in type_data:
+            message_text += f"• Ставка: {round(type_data['tariff'], 4)} руб./кВт·ч\n"
+        message_text += "\n"
     else:
         message_text += f"• Объем: {type_data.get('volume', '—')}\n"
         message_text += f"• Сумма: {type_data.get('amount', '—')} руб.\n\n"
@@ -1997,9 +2213,7 @@ async def edit_amount_start(call: CallbackQuery, state: FSMContext, bot: Bot):
     )
     
     # Выбираем правильное состояние в зависимости от типа
-    if edit_type == "expl":
-        await state.set_state(AdminState.waiting_for_amount_expl)
-    elif edit_type == "drainage":
+    if edit_type == "drainage":
         await state.set_state(AdminState.waiting_for_amount_drainage)
     else:
         await state.set_state(AdminState.waiting_for_edit)
@@ -2033,18 +2247,14 @@ async def add_next_reading(call: CallbackQuery, state: FSMContext, bot: Bot):
     
     next_type = missing_types[0]
     
-    if next_type == "expl":
-        await state.update_data(current_type=next_type, step="amount")
-        await state.set_state(AdminState.waiting_for_amount_expl)
-        text = f"📊 Добавление следующего показателя\n\nВведите сумму для {get_type_names().get(next_type, '')}:"
-    elif next_type == "drainage":
+    if next_type == "drainage":
         await state.update_data(current_type=next_type, step="amount")
         await state.set_state(AdminState.waiting_for_amount_drainage)
         text = f"📊 Добавление следующего показателя\n\nВведите ставку для {get_type_names().get(next_type, '')}:"
     elif next_type == "water_cold":
         await state.update_data(current_type=next_type, step="tariff")
         await state.set_state(AdminState.waiting_for_tariff)
-        text = f"📊 Добавление следующего показателя\n\nВведите тариф для {get_type_names().get(next_type, '')} (в рублях за м³):"
+        text = f"📊 Добавление следующего показателя\n\nВведите ставку для {get_type_names().get(next_type, '')} (в рублях за м³):"
     else:
         await state.update_data(current_type=next_type, step="volume")
         await state.set_state(AdminState.waiting_for_volume)
@@ -2304,8 +2514,10 @@ async def save_all_readings(call: CallbackQuery, state: FSMContext, bot: Bot):
     data = await state.get_data()
     processed_tenants = data.get('list_tenant', [])
     
-    # Проверяем, все ли арендаторы по отоплению обработаны
-    query = "SELECT b.id FROM bussines b ORDER BY b.name_company"
+    # Проверяем, все ли арендаторы по отоплению обработаны (только те, у кого есть счётчики)
+    query = """SELECT b.id FROM bussines b
+               WHERE EXISTS (SELECT 1 FROM us_readings ur WHERE ur.business_id = b.id)
+               ORDER BY b.name_company"""
     users_records = await get_data(query) 
     all_tenant_ids = [user['id'] for user in users_records]
     
@@ -2339,12 +2551,11 @@ async def save_all_readings(call: CallbackQuery, state: FSMContext, bot: Bot):
         return
     
     # Проверка 3: Все ли общие показатели заполнены
-    required_common = ["electro", "water_cold", "expl", "drainage"]
+    required_common = ["electro", "water_cold", "drainage"]
     missing_common = []
     common_names = {
         'electro': '⚡ Электроэнергия',
         'water_cold': '🚰 Холодная вода',
-        'expl': '🏢 Комм. услуги',
         'drainage': '💧 Водоотведение'
     }
     
@@ -2359,7 +2570,7 @@ async def save_all_readings(call: CallbackQuery, state: FSMContext, bot: Bot):
         )
         return
     
-    # ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ - можно предлагать файлы и непредвиденные расходы
+    # ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ - можно предлагать файлы перед отправкой
     await state.set_state(AdminState.collecting_data)
     
     # Показываем сводку и спрашиваем про дополнения
@@ -2373,8 +2584,7 @@ async def save_all_readings(call: CallbackQuery, state: FSMContext, bot: Bot):
     # Общие показатели
     names = {
         "electro": "⚡ Электроэнергия",
-        "water_cold": "🚰 Холодная вода", 
-        "expl": "🏢 Комм. услуги",
+        "water_cold": "🚰 Холодная вода",
         "drainage": "💧 Водоотведение"
     }
     
@@ -2385,15 +2595,14 @@ async def save_all_readings(call: CallbackQuery, state: FSMContext, bot: Bot):
         report += f"{label}\n"
         
         if reading_type == "water_cold":
-            report += f"• Тариф: {data_item.get('tariff', 0)} руб./м³\n\n"
-        elif reading_type in ["expl", "drainage"]:
+            report += f"• Ставка: {data_item.get('tariff', 0)} руб./м³\n\n"
+        elif reading_type == "drainage":
             report += f"• Сумма: {data_item.get('amount', 0)} руб.\n\n"
         else:
             report += f"• Объем: {data_item.get('volume', 0)}\n"
             report += f"• Сумма: {data_item.get('amount', 0)} руб.\n\n"
     
     builder = InlineKeyboardBuilder()
-    builder.button(text="💰 Добавить непредвиденные расходы", callback_data="admin_unexpected_expenses")
     builder.button(text="📎 Прикрепить документы", callback_data="admin_attach_documents")
     builder.button(text="✅ Отправить без дополнений", callback_data="admin_final_save")
     builder.button(text="❌ Отмена", callback_data="admin_cancel")
@@ -2631,7 +2840,7 @@ async def cancel_final_documents(call: CallbackQuery, state: FSMContext, bot: Bo
     collected_types = list(collected_data.keys())
     
     # Проверяем, все ли типы заполнены
-    all_types = ["electro", "water_cold", "water_hot", "expl", "drainage", "heating"]
+    all_types = ["electro", "water_cold", "water_hot", "drainage", "heating"]
     missing_types = [t for t in all_types if t not in collected_types]
     
     names = get_type_labels()
@@ -2666,15 +2875,16 @@ async def cancel_final_documents(call: CallbackQuery, state: FSMContext, bot: Bo
             report += f"{label}\n"
             
             if reading_type == "water_cold":
-                report += f"• Тариф: {data_item.get('tariff', 0)} руб./м³\n\n"
-            elif reading_type in ["expl", "drainage"]:
+                report += f"• Ставка: {data_item.get('tariff', 0)} руб./м³\n\n"
+            elif reading_type == "drainage":
+                report += f"• Сумма: {data_item.get('amount', 0)} руб.\n\n"
+            elif reading_type == "expl":
                 report += f"• Сумма: {data_item.get('amount', 0)} руб.\n\n"
             else:
                 report += f"• Объем: {data_item.get('volume', 0)}\n"
                 report += f"• Сумма: {data_item.get('amount', 0)} руб.\n\n"
         
         builder = InlineKeyboardBuilder()
-        builder.button(text="💰 Непредвиденные расходы", callback_data="admin_unexpected_expenses")
         builder.button(text="📎 Прикрепить документы", callback_data="admin_attach_documents")
         builder.button(text="✅ Отправить", callback_data="admin_final_save")
         builder.button(text="❌ Отмена", callback_data="admin_cancel")
@@ -2756,7 +2966,18 @@ async def proceed_with_final_save(call: CallbackQuery, state: FSMContext, bot: B
              f"{stages[1][2]}",
         parse_mode=ParseMode.HTML
     )
-    await admin_indicators(collected_data)
+    try:
+        await admin_indicators(collected_data)
+    except Exception as e:
+        logging.exception("admin_indicators: не удалось сохранить показатели в Excel: %s", e)
+        try:
+            await bot.send_message(
+                chat_id=call.message.chat.id,
+                text=f"⚠️ <b>Показатели в общий Excel не записаны.</b>\nПричина: <code>{e}</code>\nРассылка продолжается...",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
     await asyncio.sleep(0.3)
     
     # Шаг 3 - получение списка пользователей
@@ -2799,16 +3020,44 @@ async def proceed_with_final_save(call: CallbackQuery, state: FSMContext, bot: B
             parse_mode=ParseMode.HTML
         )
         
-        # Создаем и отправляем счет
-        # text_for_user = await get_volume_and_amount_month(user)
+        # Проверяем наличие счётчиков у арендатора
+        from handlers.run import get_info_business, get_form_of_doing_info_business
+        from handlers.meter_readings import get_sheet_name
+        records = await get_data('SELECT id_business FROM users WHERE User_Id = $1', str(user))
+        id_business = None
+        if records and records[0]['id_business']:
+            id_business = records[0]['id_business']
+
+        has_meters = False
+        if id_business is not None:
+            try:
+                meters_check = await get_data(
+                    'SELECT COUNT(*) as cnt FROM us_readings WHERE business_id = $1',
+                    id_business
+                )
+                has_meters = meters_check and meters_check[0]['cnt'] > 0
+            except Exception:
+                has_meters = False
+
+        print(f"[DEBUG] Пользователь {user}: id_business={id_business}, has_meters={has_meters}")
+
+        if not has_meters:
+            print(f"[DEBUG] Пользователь {user}: нет счётчиков — пропускаем Акт и Счёт КУ")
+            continue
+
+        # Создаем и отправляем Акт + Счёт КУ
         print(f"{collected_data}")
         print(f"Пользователь {user}")
         print(f"{count_users}")
         print(f"{info_list}")
         print(f"{unexpected_expenses}")
-        from handlers.run import get_info_business
-        from handlers.meter_readings import get_sheet_name
-        file = await create_word(user, count_users, collected_data, info_list, unexpected_expenses, get_info_business, get_sheet_name)
+        word_result = await create_word(user, count_users, collected_data, info_list, unexpected_expenses, get_info_business, get_sheet_name)
+        if isinstance(word_result, tuple):
+            file, ku_total = word_result
+        else:
+            file, ku_total = word_result, 0
+        
+        print(f"[DEBUG] Пользователь {user}: file={'OK' if file else 'None'}, ku_total={ku_total}")
         
         if file is None:
             await bot.send_message(
@@ -2819,86 +3068,186 @@ async def proceed_with_final_save(call: CallbackQuery, state: FSMContext, bot: B
             )
             continue
             
-        # Генерируем красивое имя файла на основе периода
-        nice_filename = f"Счет {period_str}.docx"
+        # Генерируем красивое имя файла на основе периода и формы бизнеса
+        fod_name = await get_form_of_doing_info_business(user)
+        nice_filename = f"Акт расчета КУ {fod_name} {period_str}.docx"
         document = FSInputFile(file, filename=nice_filename)
         
-        caption = '🧾 Ваш счёт за прошедший месяц'
-        if unexpected_expenses > 0:
-            caption += f'\n\n💰 Непредвиденные расходы: {unexpected_expenses} руб.'
+        # Индивидуальные суммы для caption
+        user_unexp_final = 0
+        user_expl_final = 0
+        try:
+            from handlers.excel_tg_test import get_sheet_name_in_id_business
+            import pandas as pd
+            sheet = await get_sheet_name_in_id_business(id_business)
+            df = pd.read_excel('docs/ГИРА_1006теккаа2.xlsx', sheet_name=sheet, header=None).fillna(0)
+            for c in reversed(range(len(df.columns))):
+                try:
+                    v = float(df.iloc[11, c])
+                    if v > 0: user_unexp_final = v; break
+                except: continue
+            for c in reversed(range(len(df.columns))):
+                try:
+                    v = float(df.iloc[10, c])
+                    if v > 0: user_expl_final = v; break
+                except: continue
+        except:
+            pass
         
-        sent_message = await bot.send_document(
-            chat_id=int(user),
-            document=document,
-            caption=caption
-        )
+        caption = '🧾 Ваш счёт за прошедший месяц'
+        caption_parts = []
+        if user_unexp_final > 0:
+            caption_parts.append(f'💰 Непредвиденные расходы: {user_unexp_final:.2f} руб.')
+        if user_expl_final > 0:
+            caption_parts.append(f'🏢 Эксплуатационные услуги: {user_expl_final:.2f} руб.')
+        if caption_parts:
+            caption += '\n\n' + '\n'.join(caption_parts)
+        
+        try:
+            sent_message = await bot.send_document(
+                chat_id=int(user),
+                document=document,
+                caption=caption
+            )
+        except Exception as e:
+            logging.exception("Не удалось отправить счёт пользователю %s: %s", user, e)
+            try:
+                await bot.send_message(
+                    chat_id=call.message.chat.id,
+                    text=f"⚠️ Не удалось отправить счёт пользователю <code>{user}</code>: <code>{e}</code>\nСледующий арендатор...",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+            try:
+                os.unlink(file)
+            except OSError:
+                pass
+            continue
+
         today_date = date.today()
         file_id = sent_message.document.file_id
-        records = await get_data('SELECT id_business FROM users WHERE User_Id = $1',str(user))
-        if not records or not records[0]['id_business']:
+        if not id_business:
             logging.warning(f"Пользователь {user} не найден в таблице Users или не привязан к бизнесу. Пропускаем запись документа.")
-            id_business = None
         else:
-            id_business = records[0]['id_business']
-            # Сохраняем и file_id, и оригинальное имя файла
-            await new_data_insert('INSERT INTO business_documents(id_business, file_id, date_added, file_name) VALUES ($1, $2, $3, $4)', id_business, file_id, today_date, nice_filename)
-        
+            try:
+                await new_data_insert('INSERT INTO business_documents(id_business, file_id, date_added, file_name) VALUES ($1, $2, $3, $4)', id_business, file_id, today_date, nice_filename)
+            except Exception as e:
+                logging.exception("Не удалось записать business_documents для пользователя %s: %s", user, e)
+
         # Дублируем файл в админский чат
-        await bot.send_document(
-            chat_id=call.message.chat.id,
-            document=FSInputFile(file, filename=nice_filename),
-            caption=f"📁 Копия счёта ({nice_filename}), отправленного арендатору: <code>{user}</code>",
-            parse_mode="HTML"
-        )
-        
-        os.unlink(file)
-        
+        try:
+            await bot.send_document(
+                chat_id=call.message.chat.id,
+                document=FSInputFile(file, filename=nice_filename),
+                caption=f"📁 Копия счёта ({nice_filename}), отправленного арендатору: <code>{user}</code>",
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            logging.exception("Не удалось отправить копию счёта в админский чат для пользователя %s: %s", user, e)
+
+        try:
+            os.unlink(file)
+        except OSError as e:
+            logging.warning("Не удалось удалить временный файл %s: %s", file, e)
+
+        # Генерация и отправка Счёта КУ (xlsx)
+        try:
+            from handlers.create_layout import create_invoice_for_ku_for_user
+            biz_records = await get_info_business(user)
+            fod_name = await get_form_of_doing_info_business(user)
+            if biz_records:
+                biz = biz_records[0]
+                ku_full_name = f'''{fod_name} "{biz['name_company']}"'''
+                ku_agreement = biz.get('agreement', '')
+                ku_number = int(biz.get('number_act_ku') or 0) + 1
+
+                ku_xlsx_path = await create_invoice_for_ku_for_user(
+                    ku_number, ku_full_name, ku_agreement, ku_total,
+                    start, end
+                )
+                ku_nice_filename = f"Счет на оплату КУ {period_str}.xlsx"
+                ku_document = FSInputFile(ku_xlsx_path, filename=ku_nice_filename)
+
+                ku_sent = await bot.send_document(
+                    chat_id=int(user),
+                    document=ku_document,
+                    caption='📄 Ваш счёт на оплату КУ за прошедший месяц'
+                )
+
+                await new_data_insert(
+                    'UPDATE bussines SET number_act_ku = $1 WHERE id = $2',
+                    ku_number, id_business
+                )
+                ku_file_id = ku_sent.document.file_id
+                await new_data_insert(
+                    'INSERT INTO business_documents(id_business, file_id, date_added, file_name) VALUES ($1, $2, $3, $4)',
+                    id_business, ku_file_id, today_date, ku_nice_filename
+                )
+
+                await bot.send_document(
+                    chat_id=call.message.chat.id,
+                    document=FSInputFile(ku_xlsx_path, filename=ku_nice_filename),
+                    caption=f"📁 Копия счёта КУ ({ku_nice_filename}), отправленного арендатору: <code>{user}</code>",
+                    parse_mode="HTML"
+                )
+
+                try:
+                    os.unlink(ku_xlsx_path)
+                except OSError:
+                    pass
+        except Exception as e:
+            logging.exception("Не удалось сгенерировать/отправить счёт КУ пользователю %s: %s", user, e)
+
         # Отправляем приложенные документы
         for doc in documents:
-            mime = (doc.get('mime_type') or "").lower()
-            file_id = doc.get('file_id')
-            file_name = doc.get('file_name', 'Счет')
-            cached_bytes = doc.get('cached_bytes')
-            
-            if "image" in mime or file_name.lower().endswith(('.jpg', '.jpeg', '.png')):
-                # Фото — используем кешированные байты если есть
-                if cached_bytes:
-                    from aiogram.types.input_file import BufferedInputFile
-                    photo_input = BufferedInputFile(cached_bytes, filename=file_name)
-                    await bot.send_photo(
-                        chat_id=int(user),
-                        photo=photo_input,
-                        caption=f"📸 Подтверждающее фото"
-                    )
+            try:
+                mime = (doc.get('mime_type') or "").lower()
+                attach_file_id = doc.get('file_id')
+                file_name = doc.get('file_name', 'Счет')
+                cached_bytes = doc.get('cached_bytes')
+
+                if "image" in mime or file_name.lower().endswith(('.jpg', '.jpeg', '.png')):
+                    # Фото — используем кешированные байты если есть
+                    if cached_bytes:
+                        from aiogram.types.input_file import BufferedInputFile
+                        photo_input = BufferedInputFile(cached_bytes, filename=file_name)
+                        await bot.send_photo(
+                            chat_id=int(user),
+                            photo=photo_input,
+                            caption=f"📸 Подтверждающее фото"
+                        )
+                    else:
+                        await bot.send_photo(
+                            chat_id=int(user),
+                            photo=attach_file_id,
+                            caption=f"📸 Подтверждающее фото"
+                        )
+                elif "video" in mime or file_name.lower().endswith(('.mp4', '.mov', '.avi')):
+                    if cached_bytes:
+                        from aiogram.types.input_file import BufferedInputFile
+                        video_input = BufferedInputFile(cached_bytes, filename=file_name)
+                        await bot.send_video(
+                            chat_id=int(user),
+                            video=video_input,
+                            caption=f"🎬 Подтверждающее видео"
+                        )
+                    else:
+                        await bot.send_video(
+                            chat_id=int(user),
+                            video=attach_file_id,
+                            caption=f"🎬 Подтверждающее видео"
+                        )
                 else:
-                    await bot.send_photo(
+                    # Это документ - отправляем как документ (токен для файлов работает)
+                    await bot.send_document(
                         chat_id=int(user),
-                        photo=file_id,
-                        caption=f"📸 Подтверждающее фото"
+                        document=attach_file_id,
+                        caption=f"📎 Подтверждающий документ: {file_name}"
                     )
-            elif "video" in mime or file_name.lower().endswith(('.mp4', '.mov', '.avi')):
-                if cached_bytes:
-                    from aiogram.types.input_file import BufferedInputFile
-                    video_input = BufferedInputFile(cached_bytes, filename=file_name)
-                    await bot.send_video(
-                        chat_id=int(user),
-                        video=video_input,
-                        caption=f"🎬 Подтверждающее видео"
-                    )
-                else:
-                    await bot.send_video(
-                        chat_id=int(user),
-                        video=file_id,
-                        caption=f"🎬 Подтверждающее видео"
-                    )
-            else:
-                # Это документ - отправляем как документ (токен для файлов работает)
-                await bot.send_document(
-                    chat_id=int(user),
-                    document=file_id,
-                    caption=f"📎 Подтверждающий документ: {file_name}"
-                )
-        
+            except Exception as e:
+                logging.exception("Не удалось отправить вложение пользователю %s (%s): %s", user, doc.get('file_name'), e)
+
         # await bot.send_message(chat_id=int(user), text=text_for_user)
         await asyncio.sleep(0.2)
     
@@ -2943,8 +3292,10 @@ async def proceed_with_final_save(call: CallbackQuery, state: FSMContext, bot: B
         report += f"{label}\n"
         
         if reading_type == "water_cold":
-            report += f"• Тариф: {data.get('tariff', 0)} руб./м³\n\n"
-        elif reading_type in ["expl", "drainage"]:
+            report += f"• Ставка: {data.get('tariff', 0)} руб./м³\n\n"
+        elif reading_type == "drainage":
+            report += f"• Сумма: {data.get('amount', 0)} руб.\n\n"
+        elif reading_type == "expl":
             report += f"• Сумма: {data.get('amount', 0)} руб.\n\n"
         else:
             report += f"• Объем: {data.get('volume', 0)}\n"
@@ -3014,6 +3365,102 @@ async def admin_refresh(call: CallbackQuery, state: FSMContext, bot: Bot):
     )
     await call.answer("✅ Обновлено")
 
+@admin_router.callback_query(F.data == "admin_my_bills")
+async def admin_my_bills(call: CallbackQuery, state: FSMContext, bot: Bot):
+    """Мои счета — список компаний для просмотра документов"""
+    companies = await get_data(
+        'SELECT b.id, b.name_company FROM bussines b ORDER BY b.name_company'
+    )
+    if not companies:
+        await call.answer("Нет компаний")
+        return
+    
+    builder = InlineKeyboardBuilder()
+    for comp in companies:
+        builder.row(InlineKeyboardButton(
+            text=f"📁 {comp['name_company'] or 'ID: ' + str(comp['id'])}",
+            callback_data=f"admin_bills_{comp['id']}"
+        ))
+    builder.row(InlineKeyboardButton(text="🔙 Назад", callback_data="admin_to_main"))
+    builder.adjust(1)
+    
+    await state.set_state(AdminState.viewing_bills)
+    await edit_admin_message(
+        bot,
+        call.message.message_id,
+        "📁 <b>Мои счета</b>\n\nВыберите компанию для просмотра документов:",
+        reply_markup=builder.as_markup(),
+        parse_mode=ParseMode.HTML,
+    )
+    await call.answer()
+
+@admin_router.callback_query(F.data.startswith("admin_bills_"), StateFilter(AdminState.viewing_bills))
+async def admin_view_company_bills(call: CallbackQuery, state: FSMContext, bot: Bot):
+    """Показать документы выбранной компании"""
+    company_id = int(call.data.split("_")[2])
+    
+    company = await get_data('SELECT name_company FROM bussines WHERE id = $1', company_id)
+    company_name = company[0]['name_company'] if company else 'Компания'
+    
+    docs = await get_data(
+        'SELECT file_id, file_name, date_added FROM business_documents '
+        'WHERE id_business = $1',
+        company_id,
+    )
+    if docs:
+        docs = sorted(docs, key=admin_my_bills_sort_key)
+    
+    if not docs:
+        builder = InlineKeyboardBuilder()
+        builder.row(InlineKeyboardButton(text="🔙 Назад", callback_data="admin_my_bills"))
+        await edit_admin_message(
+            bot,
+            call.message.message_id,
+            f"📁 <b>{company_name}</b>\n\nДокументов пока нет.",
+            reply_markup=builder.as_markup(),
+            parse_mode=ParseMode.HTML,
+        )
+        await call.answer()
+        return
+    
+    total = len(docs)
+    await call.message.edit_text(
+        f"📁 <b>{company_name}</b>\n\n"
+        f"К отправке файлов: <b>{total}</b>\n\n"
+        "Документы 👇",
+        parse_mode=ParseMode.HTML,
+    )
+    
+    sent_ok = 0
+    for doc in docs:
+        try:
+            fname = doc.get('file_name') or "Документ"
+            await bot.send_document(
+                chat_id=call.message.chat.id,
+                document=doc['file_id'],
+                caption=f"📄 {fname}",
+                filename=fname
+            )
+            sent_ok += 1
+        except Exception:
+            await bot.send_message(call.message.chat.id, f"⚠️ Не удалось отправить: {fname}")
+    
+    await state.set_state(AdminState.admin_menu)
+    if sent_ok == total:
+        tail = f"Отправлено файлов: <b>{sent_ok}</b>."
+    else:
+        tail = f"Удалось отправить: <b>{sent_ok}</b> из <b>{total}</b>."
+    await bot.send_message(
+        call.message.chat.id,
+        "📎 <b>Все документы по этой компании отправлены выше.</b>\n\n"
+        f"{tail}\n\n"
+        "На этом список документов закончился. Другую компанию можно открыть "
+        "через «Мои счета», либо выберите любое действие в админ-панели:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=admin_main_keyboard(),
+    )
+    await call.answer()
+
 @admin_router.callback_query(F.data == "admin_to_main")
 async def back_to_main(call: CallbackQuery, state: FSMContext, bot: Bot):
     """Вернуться в главное меню"""
@@ -3048,22 +3495,20 @@ async def admin_cancel(call: CallbackQuery, state: FSMContext, bot: Bot):
             # Формируем сообщение с текущими данными
             report = "📊 Текущие показания:\n\n"
             
-            names = {
-                "electro": "⚡ Электроэнергия",
-                "water_cold": "🚰 Холодная вода", 
-                "expl": "🏢 Комм. услуги",
-                "drainage": "💧 Водоотведение"
-            }
+            names = get_type_labels()
             
-            all_types = ["electro", "water_cold", "expl", "drainage"]
-            
-            for reading_type in all_types:
+            for reading_type in ALL_TYPES:
                 label = names.get(reading_type, reading_type)
                 if reading_type in collected_data:
                     data = collected_data[reading_type]
                     report += f"✅ {label}\n"
-                    report += f"• Объем: {data.get('volume', '—')}\n"
-                    report += f"• Сумма: {data.get('amount', '—')} руб.\n\n"
+                    if reading_type == 'water_cold':
+                        report += f"• Ставка: {data.get('tariff', '—')} руб./м³\n\n"
+                    elif reading_type == 'drainage':
+                        report += f"• Сумма: {data.get('amount', '—')} руб.\n\n"
+                    else:
+                        report += f"• Объем: {data.get('volume', '—')}\n"
+                        report += f"• Сумма: {data.get('amount', '—')} руб.\n\n"
                 else:
                     report += f"❌ {label} — не заполнено\n\n"
             
@@ -3071,7 +3516,7 @@ async def admin_cancel(call: CallbackQuery, state: FSMContext, bot: Bot):
             
             # Проверяем, все ли типы заполнены
             collected_types = list(collected_data.keys())
-            missing_types = [t for t in all_types if t not in collected_types]
+            missing_types = [t for t in ALL_TYPES if t not in collected_types]
             
             if missing_types:
                 # Есть не заполненные типы
@@ -3421,7 +3866,7 @@ async def confirm_broadcast(call: CallbackQuery, state: FSMContext, bot: Bot):
     # Определяем получателей
     if audience == "all":
         # Запрос: получить ID всех активных пользователей кроме отправителя
-        query = "SELECT User_Id FROM Users WHERE User_Id != $1"
+        query = "SELECT user_id FROM users WHERE user_id != $1"
         result = await get_data(query, str(call.message.chat.id))
         targets = [row['user_id'] for row in result] if result else []
     else:
@@ -3546,105 +3991,271 @@ async def confirm_broadcast(call: CallbackQuery, state: FSMContext, bot: Bot):
     await call.answer()
 
 # ===== УПРАВЛЕНИЕ ПОЛЬЗОВАТЕЛЯМИ =====
-@admin_router.callback_query(F.data == "admin_manage_users_back", StateFilter(AdminState.managing_users))
-async def manage_users(call: CallbackQuery, state: FSMContext, bot: Bot):
-    await state.set_state(AdminState.managing_users)
-    
-    # Запрос: общее количество пользователей
-    query = "SELECT COUNT(*) as count FROM users"
-    result = await get_data(query)
-    total_users = result[0]['count'] if result else 0
-    
-    builder = InlineKeyboardBuilder()
-    builder.button(text="📋 Список пользователей", callback_data="admin_users_list")
-    builder.button(text="🔙 Назад", callback_data="admin_to_main")
-    builder.adjust(1)
-    
-    await edit_admin_message(
-        bot,
-        call.message.message_id,
-        f"👤 Управление пользователями\n\n"
-        f"Всего активных пользователей: {total_users}\n\n"
-        "Выберите действие:",
-        reply_markup=builder.as_markup()
-    )
-    await call.answer()
 
-# @admin_router.callback_query(F.data == "admin_manage_users", StateFilter(AdminState.admin_menu))
-# async def manage_users(call: CallbackQuery, state: FSMContext, bot: Bot):
-#     """Управление пользователями"""
-#     await state.set_state(AdminState.managing_users)
-    
-#     # Запрос: общее количество пользователей
-#     query = "SELECT COUNT(*) as count FROM users"
-#     result = await get_data(query)
-#     total_users = result[0]['count'] if result else 0
-    
-#     builder = InlineKeyboardBuilder()
-#     builder.button(text="📋 Список пользователей", callback_data="admin_users_list")
-#     builder.button(text="🔙 Назад", callback_data="admin_to_main")
-#     builder.adjust(1)
-    
-#     await edit_admin_message(
-#         bot,
-#         call.message.message_id,
-#         f"👤 Управление пользователями\n\n"
-#         f"Всего активных пользователей: {total_users}\n\n"
-#         "Выберите действие:",
-#         reply_markup=builder.as_markup()
-#     )
-    await call.answer()
+USERS_PER_PAGE = 8
 
-@admin_router.callback_query(F.data == "admin_users_list", StateFilter(AdminState.managing_users))
-async def users_list(call: CallbackQuery, state: FSMContext, bot: Bot):
+
+async def _build_user_list_keyboard(page: int = 0) -> Tuple[str, InlineKeyboardMarkup]:
     query = """
-    SELECT u.username, b.name_company, b.square, b.agreement, b.acceptance_certificate
-    FROM users u 
-    JOIN bussines b ON b.id = u.id_business
-    ORDER BY b.name_company
+    SELECT u.user_id, u.username, u.first_name, u.second_name,
+           b.name_company
+    FROM users u
+    LEFT JOIN bussines b ON b.id = u.id_business
+    ORDER BY b.name_company NULLS LAST, u.user_id
     """
-    users = await get_data(query)
-    print(users)
-    
-    if not users:
-        await call.answer("Нет пользователей", show_alert=True)
-        return
-    
-    users_text = "👥 Список пользователей:\n\n"
-    for i, user in enumerate(users, 1):
-        
-        if user['username'] is None:
-            username = 'Пусто'
-        else:
-            username = user['username']
-        print(username)
-        name_company = user['name_company']
-        square = user['square']
-        agreement = user['agreement']
-        acceptance_certificate = user['acceptance_certificate']
-        
-        users_text += f"Название организации/арендатора: {name_company}\n"
-        if username == 'Пусто':
-            users_text += f"|——имя пользователя: Пусто\n"
-        else:
-            users_text += f"|——имя пользователя: @{username}\n"
-        users_text += f"|——Площадь: {square}\n"
-        users_text += f"|——Номер договора: {agreement}\n"
-        users_text += f"|——Акт п/п: {acceptance_certificate}\n\n"
+    users = await get_data(query) or []
+    total = len(users)
 
-    
+    if total == 0:
+        builder = InlineKeyboardBuilder()
+        builder.row(InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_list"))
+        return "👥 <b>Пользователи</b>\n\nНет зарегистрированных пользователей.", builder.as_markup()
+
+    start = page * USERS_PER_PAGE
+    end = start + USERS_PER_PAGE
+    page_users = users[start:end]
+    total_pages = (total + USERS_PER_PAGE - 1) // USERS_PER_PAGE
+
     builder = InlineKeyboardBuilder()
-    builder.button(text="🔙 Назад", callback_data="admin_manage_users_back")
-    builder.adjust(1)
-    
-    await edit_admin_message(
-        bot,
-        call.message.message_id,
-        users_text,
-        reply_markup=builder.as_markup(),
-        parse_mode="HTML"
+    for u in page_users:
+        uid = u["user_id"]
+        company = u.get("name_company") or "без компании"
+        uname = u.get("username") or ""
+        label = f"{company}"
+        if uname:
+            label += f" (@{uname})"
+        if len(label) > 40:
+            label = label[:38] + "…"
+        builder.row(InlineKeyboardButton(text=label, callback_data=f"admusr:{uid}"))
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"usrpage_{page - 1}"))
+    nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
+    if end < total:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"usrpage_{page + 1}"))
+    if nav:
+        builder.row(*nav)
+    builder.row(InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_list"))
+
+    text = f"👥 <b>Пользователи</b> ({total})\n\nВыберите для редактирования:"
+    return text, builder.as_markup()
+
+
+async def _build_user_detail(user_id: str) -> Optional[Tuple[str, InlineKeyboardMarkup]]:
+    query = """
+    SELECT u.user_id, u.username, u.first_name, u.second_name, u.patronymic,
+           u.phone_number, b.name_company, u.id_business
+    FROM users u
+    LEFT JOIN bussines b ON b.id = u.id_business
+    WHERE u.user_id = $1
+    """
+    rows = await get_data(query, user_id)
+    if not rows:
+        return None
+    u = dict(rows[0])
+    fio_parts = [
+        str(u.get("second_name") or "").strip(),
+        str(u.get("first_name") or "").strip(),
+        str(u.get("patronymic") or "").strip(),
+    ]
+    fio = " ".join(p for p in fio_parts if p) or "не указано"
+    uname = u.get("username") or "не указан"
+    phone = str(u.get("phone_number") or "").strip() or "не указан"
+    company = u.get("name_company") or "не привязан"
+
+    lines = [
+        "👤 <b>Карточка пользователя</b>\n",
+        f"🆔 <b>Telegram ID:</b> <code>{u['user_id']}</code>",
+        f"📱 <b>Username:</b> @{uname}" if uname != "не указан" else f"📱 <b>Username:</b> {uname}",
+        f"👤 <b>ФИО:</b> {fio}",
+        f"📞 <b>Телефон:</b> {phone}",
+        f"🏢 <b>Компания:</b> {company}",
+    ]
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="👤 ФИО", callback_data=f"edtusr_fio:{user_id}"),
+            InlineKeyboardButton(text="📞 Телефон", callback_data=f"edtusr_phone:{user_id}"),
+        ],
+        [InlineKeyboardButton(text="🏢 Сменить компанию", callback_data=f"edtusr_company:{user_id}")],
+        [InlineKeyboardButton(text="🔙 К списку", callback_data="admin_users_hub")],
+    ])
+    return "\n".join(lines), kb
+
+
+@admin_router.callback_query(F.data == "admin_users_hub")
+async def admin_users_hub(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminState.managing_users)
+    text, kb = await _build_user_list_keyboard(0)
+    await callback.message.edit_text(text=text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    await callback.answer()
+
+
+@admin_router.callback_query(F.data.startswith("usrpage_"), StateFilter(AdminState.managing_users))
+async def users_page(callback: CallbackQuery, state: FSMContext):
+    page = int(callback.data.split("_")[1])
+    text, kb = await _build_user_list_keyboard(page)
+    await callback.message.edit_text(text=text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    await callback.answer()
+
+
+@admin_router.callback_query(F.data.startswith("admusr:"), StateFilter(AdminState.managing_users))
+async def admin_user_selected(callback: CallbackQuery, state: FSMContext):
+    user_id = callback.data.split(":")[1]
+    view = await _build_user_detail(user_id)
+    if not view:
+        await callback.answer("Пользователь не найден", show_alert=True)
+        return
+    text, kb = view
+    await callback.message.edit_text(text=text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    await state.set_state(AdminState.user_detail)
+    await callback.answer()
+
+
+@admin_router.callback_query(F.data.startswith("edtusr_fio:"), StateFilter(AdminState.user_detail))
+async def edit_user_fio_start(callback: CallbackQuery, state: FSMContext):
+    user_id = callback.data.split(":")[1]
+    await state.update_data(edit_user_id=user_id, edit_user_param="fio")
+    await state.set_state(AdminState.edit_user_param)
+    from main import bot
+    await bot.send_message(
+        chat_id=callback.message.chat.id,
+        text="✏️ Введите <b>ФИО</b> (Фамилия Имя Отчество):",
+        parse_mode=ParseMode.HTML,
     )
-    await call.answer()
+    await callback.answer()
+
+
+@admin_router.callback_query(F.data.startswith("edtusr_phone:"), StateFilter(AdminState.user_detail))
+async def edit_user_phone_start(callback: CallbackQuery, state: FSMContext):
+    user_id = callback.data.split(":")[1]
+    await state.update_data(edit_user_id=user_id, edit_user_param="phone")
+    await state.set_state(AdminState.edit_user_param)
+    from main import bot
+    await bot.send_message(
+        chat_id=callback.message.chat.id,
+        text="✏️ Введите <b>номер телефона</b>:",
+        parse_mode=ParseMode.HTML,
+    )
+    await callback.answer()
+
+
+@admin_router.callback_query(F.data.startswith("edtusr_company:"), StateFilter(AdminState.user_detail))
+async def edit_user_company_start(callback: CallbackQuery, state: FSMContext):
+    user_id = callback.data.split(":")[1]
+    companies = await get_companies_from_db()
+    if not companies:
+        await callback.answer("Нет компаний для привязки", show_alert=True)
+        return
+    rows = [
+        [InlineKeyboardButton(text=c["name"], callback_data=f"reassign_{user_id}_{c['id']}")]
+        for c in companies
+    ]
+    rows.append([InlineKeyboardButton(text="🔙 Назад", callback_data=f"admusr:{user_id}")])
+    await state.set_state(AdminState.selecting_user_company)
+    await state.update_data(edit_user_id=user_id)
+    await callback.message.edit_text(
+        "🏢 Выберите компанию для привязки пользователя:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        parse_mode=ParseMode.HTML,
+    )
+    await callback.answer()
+
+
+@admin_router.callback_query(
+    F.data.startswith("reassign_"),
+    StateFilter(AdminState.selecting_user_company),
+)
+async def reassign_user_company(callback: CallbackQuery, state: FSMContext):
+    parts = callback.data.split("_")
+    if len(parts) < 3:
+        await callback.answer("Ошибка формата", show_alert=True)
+        return
+    user_id = parts[1]
+    company_id = int(parts[2])
+
+    sheet_rows = await get_data("SELECT sheet_name FROM bussines WHERE id = $1", company_id)
+    sheet_name = sheet_rows[0]["sheet_name"] if sheet_rows and sheet_rows[0]["sheet_name"] else None
+
+    if sheet_name:
+        await new_data_insert(
+            "UPDATE users SET id_business = $1, sheets_name = $2 WHERE user_id = $3",
+            company_id, sheet_name, user_id,
+        )
+    else:
+        await new_data_insert(
+            "UPDATE users SET id_business = $1 WHERE user_id = $2",
+            company_id, user_id,
+        )
+
+    view = await _build_user_detail(user_id)
+    if not view:
+        await callback.answer("Ошибка", show_alert=True)
+        return
+    text, kb = view
+    await callback.message.edit_text(
+        text=f"✅ Компания обновлена!\n\n{text}",
+        reply_markup=kb,
+        parse_mode=ParseMode.HTML,
+    )
+    await state.set_state(AdminState.user_detail)
+    await callback.answer()
+
+
+@admin_router.message(StateFilter(AdminState.edit_user_param))
+async def process_edit_user_value(message: Message, state: FSMContext, bot: Bot):
+    if not message.text:
+        return
+    data = await state.get_data()
+    user_id = data.get("edit_user_id")
+    param = data.get("edit_user_param")
+    if not user_id or not param:
+        await message.answer("Ошибка данных.")
+        await state.clear()
+        return
+
+    new_value = message.text.strip()
+
+    if param == "fio":
+        parts = new_value.split()
+        if len(parts) < 3:
+            await message.answer("❌ Введите полное ФИО (минимум 3 слова).\nПопробуйте снова.")
+            return
+        if not re.match(r"^[а-яА-ЯёЁ\s\-]+$", new_value):
+            await message.answer("❌ ФИО: только кириллица, пробелы и дефисы.\nПопробуйте снова.")
+            return
+        surname = parts[0]
+        first_name = parts[1]
+        patronymic = " ".join(parts[2:])
+        await new_data_insert(
+            "UPDATE users SET second_name=$1, first_name=$2, patronymic=$3 WHERE user_id=$4",
+            surname, first_name, patronymic, user_id,
+        )
+    elif param == "phone":
+        cleaned = re.sub(r"[\s\-\(\)]", "", new_value)
+        if len(cleaned) < 6 or len(cleaned) > 15:
+            await message.answer("❌ Некорректный номер телефона.\nПопробуйте снова.")
+            return
+        await new_data_insert(
+            "UPDATE users SET phone_number=$1 WHERE user_id=$2",
+            cleaned[:10], user_id,
+        )
+    else:
+        await message.answer("Неизвестный параметр.")
+        return
+
+    view = await _build_user_detail(user_id)
+    if not view:
+        await message.answer("Ошибка загрузки данных.")
+        return
+    text, kb = view
+    await state.set_state(AdminState.user_detail)
+    await bot.send_message(
+        chat_id=message.chat.id,
+        text=f"✅ Обновлено!\n\n{text}",
+        reply_markup=kb,
+        parse_mode=ParseMode.HTML,
+    )
 
 
 
@@ -3654,7 +4265,7 @@ async def users_list(call: CallbackQuery, state: FSMContext, bot: Bot):
 
 async def get_companies_from_db() -> List[Dict]:
     try:
-        query = "SELECT id, name_company FROM Bussines ORDER BY name_company"
+        query = "SELECT id, name_company FROM bussines ORDER BY name_company"
         records_list = await get_data(query)
         
         companies = []
@@ -3674,19 +4285,93 @@ async def get_company_details(company_id: int) -> Dict:
     try:
         query = """
         SELECT b.*, fdb.name as form_name, toa.name as activity_name
-        FROM Bussines b
+        FROM bussines b
         LEFT JOIN form_of_doing_business fdb ON b.id_form = fdb.id
-        LEFT JOIN Type_of_Activity toa ON b.id_type_of_activity = toa.id
+        LEFT JOIN type_of_activity toa ON b.id_type_of_activity = toa.id
         WHERE b.id = $1
         """
         records_list = await get_data(query, company_id)
         
         if records_list and len(records_list) > 0:
-            return records_list[0]
+            row = dict(records_list[0])
+            # contract_end_date — псевдоним для end_date_agreement
+            end_date = row.get("end_date_agreement")
+            if end_date:
+                row["contract_end_date"] = str(end_date).strip()
+            # acceptance_certificate — date → ДД.ММ.ГГГГ
+            acc_cert = row.get("acceptance_certificate")
+            if acc_cert and hasattr(acc_cert, "strftime"):
+                row["acceptance_certificate"] = acc_cert.strftime("%d.%m.%Y")
+            # Телефон хранится в bussines.phone
+            phone_val = str(row.get("phone") or "").strip()
+            if phone_val:
+                row["phone"] = phone_val
+            else:
+                row.pop("phone", None)
+            # ФИО хранится тремя колонками: surname, first_name, patronymic
+            parts = [
+                str(row.get("surname") or "").strip(),
+                str(row.get("first_name") or "").strip(),
+                str(row.get("patronymic") or "").strip(),
+            ]
+            full_name = " ".join(p for p in parts if p)
+            if full_name:
+                row["director_name"] = full_name
+            else:
+                row.pop("director_name", None)
+            return row
         return {}
     except Exception as e:
         print(f"Ошибка при получении деталей компании: {e}")
         return {}
+
+
+async def build_company_detail_view(company_id: int) -> Optional[Tuple[str, InlineKeyboardMarkup]]:
+    """Текст и клавиатура карточки компании (как в company_selected)."""
+    company_details = await get_company_details(company_id)
+    if not company_details:
+        return None
+    meters_records = await get_data(
+        "SELECT ur.number_counter, tc.name FROM us_readings ur "
+        "JOIN type_counter tc ON ur.counter_type_id = tc.id "
+        "WHERE ur.business_id = $1 ORDER BY tc.id",
+        company_id,
+    )
+    meters_lines = []
+    if meters_records:
+        for m in meters_records:
+            t = m["name"]
+            n = m["number_counter"]
+            if t == "Холодная вода":
+                meters_lines.append(f"  ❄️ ХВС: {n}")
+            elif t == "Горячая вода":
+                meters_lines.append(f"  🔥 ГВС: {n}")
+            elif t == "Электричество":
+                meters_lines.append(f"  ⚡ Электричество: {n}")
+    meters_text = "\n".join(meters_lines) if meters_lines else "  нет счетчиков"
+    info_lines = [
+        f"👑 <b>Управление компанией</b>\n",
+        f"🏢 <b>Название:</b> {company_details.get('name_company', 'не указано')}",
+        f"📋 <b>Форма бизнеса:</b> {company_details.get('form_name', 'не указана')}",
+        f"📏 <b>Площадь:</b> {company_details.get('square', 'не указана')} кв.м",
+        f"💰 <b>Ставка аренды:</b> {company_details.get('bid', 'не указана')} руб",
+        f"📄 <b>Номер договора:</b> {company_details.get('agreement', 'не указан')}",
+        f"📅 <b>Дата завершения договора:</b> {company_details.get('contract_end_date', 'не указана')}",
+        f"📋 <b>Акт приема-передачи:</b> {company_details.get('acceptance_certificate', 'не указан')}",
+        f"📞 <b>Телефон:</b> {company_details.get('phone', 'не указан')}",
+        f"👤 <b>ФИО:</b> {company_details.get('director_name', 'не указан')}",
+    ]
+    director_title_val = company_details.get('director_title')
+    if director_title_val:
+        info_lines.append(f"👔 <b>Должность:</b> {director_title_val}")
+    info_lines.extend([
+        f"🏢 <b>Вид деятельности:</b> {company_details.get('activity_name', 'не указан')}",
+        f"\n📊 <b>Счетчики:</b>\n{meters_text}",
+    ])
+    text = "\n".join(info_lines)
+    keyboard = await create_company_actions_keyboard(company_id)
+    return text, keyboard
+
 
 async def get_business_forms():
     """Получает список форм бизнеса для выбора при добавлении"""
@@ -3701,7 +4386,7 @@ async def get_business_forms():
 async def get_activity_types():
     """Получает список видов деятельности для выбора при добавлении"""
     try:
-        query = "SELECT id, name FROM Type_of_Activity ORDER BY name"
+        query = "SELECT id, name FROM type_of_activity ORDER BY name"
         records_list = await get_data(query)
         return records_list
     except Exception as e:
@@ -3714,7 +4399,7 @@ async def create_companies_keyboard() -> InlineKeyboardMarkup:
     """Создает клавиатуру со списком компаний из БД"""
     companies = await get_companies_from_db()
     keyboard = []
-    
+
     if not companies:
         # Если компаний нет, показываем только кнопку добавления
         keyboard.extend([
@@ -3751,11 +4436,12 @@ async def create_company_actions_keyboard(company_id: int) -> InlineKeyboardMark
             InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"editcomp_{company_id}"),
             InlineKeyboardButton(text="🗑️ Удалить",style="danger", callback_data=f"deletecomp_{company_id}")
         ],
+        [InlineKeyboardButton(text="📊 Счетчики", callback_data=f"comp_meters_{company_id}")],
         [InlineKeyboardButton(text="🔙 Назад к списку", callback_data="back_to_list")]
     ])
 
-async def create_edit_choice_keyboard(company_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
+async def create_edit_choice_keyboard(company_id: int, id_form: int = None) -> InlineKeyboardMarkup:
+    rows = [
         [
             InlineKeyboardButton(text="Наименование", callback_data=f"edit_name:{company_id}"),
             InlineKeyboardButton(text="Площадь", callback_data=f"edit_square:{company_id}")
@@ -3765,10 +4451,24 @@ async def create_edit_choice_keyboard(company_id: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="Акт п/п", callback_data=f"edit_acceptance:{company_id}")
         ],
         [
-            InlineKeyboardButton(text="Договор", callback_data=f"edit_agreement:{company_id}")
+            InlineKeyboardButton(text="Договор", callback_data=f"edit_agreement:{company_id}"),
+            InlineKeyboardButton(text="Дата заверш.", callback_data=f"edit_contract_end:{company_id}")
         ],
-        [InlineKeyboardButton(text="🔙 Назад", callback_data=f"company:{company_id}")]
-    ])
+        [
+            InlineKeyboardButton(text="📞 Телефон", callback_data=f"edit_phone:{company_id}"),
+            InlineKeyboardButton(text="👤 ФИО", callback_data=f"edit_director:{company_id}")
+        ],
+        [
+            InlineKeyboardButton(text="📋 Форма бизнеса", callback_data=f"edit_form:{company_id}"),
+            InlineKeyboardButton(text="🏢 Вид деятельности", callback_data=f"edit_activity:{company_id}")
+        ],
+    ]
+    if id_form == 1:
+        rows.append([
+            InlineKeyboardButton(text="👔 Должность руководителя", callback_data=f"edit_director_title:{company_id}")
+        ])
+    rows.append([InlineKeyboardButton(text="🔙 Назад", callback_data=f"company:{company_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 # ========== ОБРАБОТЧИКИ ==========
 
@@ -3824,41 +4524,36 @@ async def handle_back_to_list(callback: CallbackQuery, state: FSMContext):
     )
     await callback.answer()
 
-@admin_router.callback_query(F.data.startswith("company:"))
+@admin_router.callback_query(
+    F.data.startswith("company:"),
+    StateFilter(
+        AdminState.company_list,
+        AdminState.company_action,
+        AdminState.edit_param,
+        AdminState.editing_meters,
+        AdminState.adding_meter_number,
+        AdminState.editing_meter_number,
+    ),
+)
 async def company_selected(callback: CallbackQuery, state: FSMContext):
     company_id = int(callback.data.split(":")[1])
-    
-    company_details = await get_company_details(company_id)
-    if not company_details:
+    view = await build_company_detail_view(company_id)
+    if not view:
         await callback.answer("Компания не найдена!")
         return
-    
-    # Форматируем информацию о компании
-    info_lines = [
-        f"👑 <b>Управление компанией</b>\n",
-        f"🏢 <b>Название:</b> {company_details.get('name_company', 'не указано')}",
-        f"📋 <b>Форма бизнеса:</b> {company_details.get('form_name', 'не указана')}",
-        f"📏 <b>Площадь:</b> {company_details.get('square', 'не указана')} кв.м",
-        f"💰 <b>Ставка аренды:</b> {company_details.get('bid', 'не указана')} руб",
-        f"📄 <b>Номер договора:</b> {company_details.get('agreement', 'не указан')}",
-        f"📅 <b>Дата завершения договора:</b> {company_details.get('contract_end_date', 'не указана')}",
-        f"📋 <b>Акт приема-передачи:</b> {company_details.get('acceptance_certificate', 'не указан')}",
-        f"📞 <b>Телефон:</b> {company_details.get('phone', 'не указан')}",
-        f"👤 <b>Генеральный директор:</b> {company_details.get('director_name', 'не указан')}",
-        f"🏢 <b>Вид деятельности:</b> {company_details.get('activity_name', 'не указан')}"
-    ]
-    
-    keyboard = await create_company_actions_keyboard(company_id)
-    
+    text, keyboard = view
     await callback.message.edit_text(
-        text="\n".join(info_lines),
+        text=text,
         reply_markup=keyboard,
         parse_mode=ParseMode.HTML
     )
     await state.set_state(AdminState.company_action)
     await callback.answer()
 
-@admin_router.callback_query(F.data.startswith("editcomp_"))
+@admin_router.callback_query(
+    F.data.startswith("editcomp_"),
+    StateFilter(AdminState.company_action, AdminState.edit_param),
+)
 async def edit_company(callback: CallbackQuery, state: FSMContext):
     company_id = int(callback.data.split("_")[1])
     
@@ -3867,7 +4562,7 @@ async def edit_company(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Компания не найдена!")
         return
     
-    keyboard = await create_edit_choice_keyboard(company_id)
+    keyboard = await create_edit_choice_keyboard(company_id, id_form=company_details.get('id_form'))
     
     await callback.message.edit_text(
         f"✏️ <b>Редактирование компании</b>\n\n"
@@ -3878,7 +4573,94 @@ async def edit_company(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AdminState.edit_param)
     await callback.answer()
 
-@admin_router.callback_query(F.data.startswith("edit_"))
+@admin_router.callback_query(F.data.startswith("edit_form:"), StateFilter(AdminState.edit_param))
+async def edit_company_form_menu(callback: CallbackQuery, state: FSMContext):
+    company_id = int(callback.data.split(":")[1])
+    forms = await get_business_forms()
+    if not forms:
+        await callback.answer("Нет форм в справочнике", show_alert=True)
+        return
+    rows = [
+        [InlineKeyboardButton(text=form["name"], callback_data=f"bizf_{company_id}_{form['id']}")]
+        for form in forms
+    ]
+    rows.append([InlineKeyboardButton(text="🔙 Назад", callback_data=f"editcomp_{company_id}")])
+    await callback.message.edit_text(
+        "Выберите <b>форму бизнеса</b>:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        parse_mode=ParseMode.HTML,
+    )
+    await callback.answer()
+
+@admin_router.callback_query(F.data.startswith("bizf_"), StateFilter(AdminState.edit_param))
+async def edit_company_form_pick(callback: CallbackQuery, state: FSMContext):
+    parts = callback.data.split("_")
+    if len(parts) < 3:
+        await callback.answer("Ошибка формата", show_alert=True)
+        return
+    company_id = int(parts[1])
+    form_id = int(parts[2])
+    await new_data_insert(
+        "UPDATE bussines SET id_form = $1 WHERE id = $2",
+        form_id,
+        company_id,
+    )
+    view = await build_company_detail_view(company_id)
+    if not view:
+        await callback.answer("Компания не найдена", show_alert=True)
+        return
+    text, keyboard = view
+    await callback.message.edit_text(
+        text=text,
+        reply_markup=keyboard,
+        parse_mode=ParseMode.HTML,
+    )
+    await state.set_state(AdminState.company_action)
+    await callback.answer("Форма обновлена")
+
+@admin_router.callback_query(F.data.startswith("edit_director_title:"), StateFilter(AdminState.edit_param))
+async def edit_director_title_menu(callback: CallbackQuery, state: FSMContext):
+    company_id = int(callback.data.split(":")[1])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Генеральный директор", callback_data=f"dt_{company_id}_gen")],
+        [InlineKeyboardButton(text="Директор", callback_data=f"dt_{company_id}_dir")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data=f"editcomp_{company_id}")],
+    ])
+    await callback.message.edit_text(
+        "Выберите <b>должность руководителя</b>:",
+        reply_markup=keyboard,
+        parse_mode=ParseMode.HTML,
+    )
+    await callback.answer()
+
+@admin_router.callback_query(F.data.startswith("dt_"), StateFilter(AdminState.edit_param))
+async def edit_director_title_pick(callback: CallbackQuery, state: FSMContext):
+    parts = callback.data.split("_")
+    if len(parts) < 3:
+        await callback.answer("Ошибка формата", show_alert=True)
+        return
+    company_id = int(parts[1])
+    title_key = parts[2]
+    title = "Генеральный директор" if title_key == "gen" else "Директор"
+    await new_data_insert(
+        "UPDATE bussines SET director_title = $1 WHERE id = $2",
+        title,
+        company_id,
+    )
+    view = await build_company_detail_view(company_id)
+    if not view:
+        await callback.answer("Компания не найдена", show_alert=True)
+        return
+    text, keyboard = view
+    await callback.message.edit_text(
+        text=text,
+        reply_markup=keyboard,
+        parse_mode=ParseMode.HTML,
+    )
+    await state.set_state(AdminState.company_action)
+    await callback.answer("Должность обновлена")
+
+@admin_router.callback_query(F.data.startswith("edit_"), StateFilter(AdminState.edit_param))
 async def edit_param_selected(callback: CallbackQuery, state: FSMContext):
     try:
         action_part, company_id_str = callback.data.split(":")
@@ -3895,7 +4677,8 @@ async def edit_param_selected(callback: CallbackQuery, state: FSMContext):
         "edit_contract_end": ("дату завершения договора", "contract_end_date"),
         "edit_acceptance": ("акт приема-передачи", "acceptance_certificate"),
         "edit_phone": ("телефон", "phone"),
-        "edit_director": ("ФИО ген директора", "director_name")
+        "edit_director": ("ФИО", "director_name"),
+        "edit_activity": ("вид деятельности", "activity_type"),
     }
     
     if action_part not in param_map:
@@ -3911,66 +4694,91 @@ async def edit_param_selected(callback: CallbackQuery, state: FSMContext):
         edit_company_id=company_id,
         edit_param_key=param_key,
         edit_param_name=param_name,
-        edit_message_id=callback.message.message_id
     )
     
-    await callback.message.edit_text(
-        f"✏️ Введите новое значение для <b>{param_name}</b>:\n\n"
-        f"Текущее значение: <code>{current_value}</code>\n\n"
-        f"<i>Отправьте новое значение в ответе:</i>",
+    from main import bot
+    await bot.send_message(
+        chat_id=callback.message.chat.id,
+        text=f"✏️ Введите новое значение для <b>{param_name}</b>:\n\n"
+             f"Текущее значение: <code>{current_value}</code>\n\n"
+             f"<i>Отправьте новое значение в ответе:</i>",
         parse_mode=ParseMode.HTML
     )
     await callback.answer()
 
 @admin_router.message(AdminState.edit_param)
-async def process_edit_value(message: Message, state: FSMContext):
+async def process_edit_value(message: Message, state: FSMContext, bot: Bot):
     data = await state.get_data()
     company_id = data.get("edit_company_id")
     param_key = data.get("edit_param_key")
     param_name = data.get("edit_param_name")
-    edit_message_id = data.get("edit_message_id")
     
     if not all([company_id, param_key]):
-        await message.edit_text("Ошибка данных! Попробуйте снова.")
+        await message.answer("Ошибка данных! Попробуйте снова.")
         await state.clear()
         return
-    
-    new_value = message.text.strip()
-    if param_key == 'name_company':
-        await new_data_insert('UPDATE Bussines SET name_company = $1 WHERE id = $2', new_value, company_id)
-    elif param_key == 'square':
-        await new_data_insert('UPDATE Bussines SET square = $1 WHERE id = $2', new_value, company_id)
-    elif param_key == 'bid':
-        await new_data_insert('UPDATE Bussines SET bid = $1 WHERE id = $2', new_value, company_id)
-    elif param_key == 'agreement':
-        await new_data_insert('UPDATE Bussines SET agreement = $1 WHERE id = $2', new_value, company_id)
-    elif param_key == 'contract_end_date':
-        await new_data_insert('UPDATE Bussines SET end_date_agreement = $1 WHERE id = $2', new_value, company_id)
-    elif param_key == 'acceptance_certificate':
-        await new_data_insert('UPDATE Bussines SET acceptance_certificate = $1 WHERE id = $2', new_value, company_id)
-    # elif param_key == 'phone':
-    #     await new_data_insert('UPDATE Bussines SET {param_key} = $1 WHERE id = $2', new_value, company_id)
-    # elif param_key == 'director_name':
 
-    #     await new_data_insert('UPDATE Bussines SET {param_key} = $1 WHERE id = $2', new_value, company_id)
-    # "edit_name": ("наименование", "name_company"),
-    #     "edit_square": ("площадь", "square"), 
-    #     "edit_bid": ("ставку аренды", "bid"),
-    #     "edit_agreement": ("номер договора", "agreement"),
-    #     "edit_contract_end": ("дату завершения договора", "acceptance_certificate"),
-    #     "edit_acceptance": ("акт приема-передачи", "contract_date"),
-    #     "edit_phone": ("телефон", "phone"),
-    #     "edit_director": ("ФИО ген директора", "director_name")
-    # Здесь будет ваш код UPDATE в БД
-    # query = f"UPDATE Bussines SET {param_key} = $1 WHERE id = $2"
-    # await get_data(query, new_value, company_id)
-    # await new_data_insert('UPDATE Bussines SET {param_key} = $1 WHERE id = $2', new_value, company_id)
-    try:
-        await message.delete()
-    except:
-        pass
-    
-    # Возвращаем к управлению компанией
+    if not message.text:
+        return
+
+    new_value = message.text.strip()
+
+    ok, err_msg, db_val = validate_company_edit_field(param_key, new_value)
+    if not ok:
+        await message.answer(f"❌ {err_msg}\nПопробуйте снова.")
+        return
+
+    db_column_map = {
+        'name_company': 'name_company',
+        'square': 'square',
+        'bid': 'bid',
+        'agreement': 'agreement',
+        'contract_end_date': 'end_date_agreement',
+        'acceptance_certificate': 'acceptance_certificate',
+        'phone': None,
+        'director_name': None,
+        'activity_type': None,
+    }
+    db_column = db_column_map.get(param_key)
+    if param_key == 'director_name':
+        parts = new_value.split()
+        surname = parts[0] if len(parts) > 0 else ''
+        firstname = parts[1] if len(parts) > 1 else ''
+        patronymic = ' '.join(parts[2:]) if len(parts) > 2 else ''
+        await new_data_insert(
+            'UPDATE bussines SET surname=$1, first_name=$2, patronymic=$3 WHERE id=$4',
+            surname, firstname, patronymic, company_id
+        )
+    elif param_key == 'phone':
+        await new_data_insert(
+            'UPDATE bussines SET phone=$1 WHERE id=$2',
+            new_value, company_id
+        )
+    elif param_key == 'activity_type':
+        await new_data_insert(
+            'INSERT INTO type_of_activity (name) VALUES ($1) ON CONFLICT (name) DO NOTHING',
+            db_val,
+        )
+        rows = await get_data(
+            'SELECT id FROM type_of_activity WHERE name = $1 LIMIT 1',
+            db_val,
+        )
+        if not rows:
+            await message.answer("❌ Не удалось сохранить вид деятельности. Попробуйте снова.")
+            return
+        id_toa = rows[0]['id']
+        await new_data_insert(
+            'UPDATE bussines SET id_type_of_activity = $1 WHERE id = $2',
+            id_toa,
+            company_id,
+        )
+    elif db_column:
+        await new_data_insert(
+            f'UPDATE bussines SET {db_column} = $1 WHERE id = $2',
+            db_val,
+            company_id,
+        )
+
     await state.set_state(AdminState.company_action)
     
     company_details = await get_company_details(company_id)
@@ -3984,22 +4792,249 @@ async def process_edit_value(message: Message, state: FSMContext):
         f"📅 <b>Дата завершения договора:</b> {company_details.get('contract_end_date', 'не указана')}",
         f"📋 <b>Акт приема-передачи:</b> {company_details.get('acceptance_certificate', 'не указан')}",
         f"📞 <b>Телефон:</b> {company_details.get('phone', 'не указан')}",
-        f"👤 <b>Генеральный директор:</b> {company_details.get('director_name', 'не указан')}"
+        f"👤 <b>ФИО:</b> {company_details.get('director_name', 'не указан')}"
     ]
     
     keyboard = await create_company_actions_keyboard(company_id)
-    
-    from main import bot
-    await bot.edit_message_text(
+
+    await bot.send_message(
         chat_id=message.chat.id,
-        message_id=edit_message_id,
         text="\n".join(info_lines),
         reply_markup=keyboard,
         parse_mode=ParseMode.HTML
     )
 
-@admin_router.callback_query(F.data.startswith('yesdeletecomp_'))
-@admin_router.callback_query(F.data.startswith('dontdeletecomp_'))
+@admin_router.callback_query(F.data.startswith("comp_meters_"))
+async def view_company_meters(callback: CallbackQuery, state: FSMContext):
+    """Просмотр и управление счетчиками компании"""
+    company_id = int(callback.data.split("_")[2])
+    await state.update_data(meters_company_id=company_id)
+    await state.set_state(AdminState.editing_meters)
+    
+    meters_records = await get_data(
+        'SELECT ur.id, ur.number_counter, tc.name FROM us_readings ur '
+        'JOIN type_counter tc ON ur.counter_type_id = tc.id '
+        'WHERE ur.business_id = $1 ORDER BY tc.id',
+        company_id
+    )
+    
+    builder = InlineKeyboardBuilder()
+    if meters_records:
+        for m in meters_records:
+            t = m['name']
+            n = m['number_counter']
+            mid = m['id']
+            icon = "❄️" if t == 'Холодная вода' else ("🔥" if t == 'Горячая вода' else "⚡")
+            label = "ХВС" if t == 'Холодная вода' else ("ГВС" if t == 'Горячая вода' else "Электро")
+            builder.row(
+                InlineKeyboardButton(text=f"{icon} {label}: {n}", callback_data=f"editmeter_{mid}"),
+                InlineKeyboardButton(text="🗑️", callback_data=f"delmeter_{mid}")
+            )
+    
+    builder.row(InlineKeyboardButton(text="➕ Добавить счетчик", callback_data=f"addmeter_{company_id}"))
+    builder.row(InlineKeyboardButton(text="🔙 Назад", callback_data=f"company:{company_id}"))
+    
+    await callback.message.edit_text(
+        "📊 <b>Управление счетчиками</b>\n\n"
+        "Нажмите на счетчик чтобы изменить номер, 🗑️ чтобы удалить:",
+        reply_markup=builder.as_markup(),
+        parse_mode=ParseMode.HTML
+    )
+    await callback.answer()
+
+@admin_router.callback_query(F.data.startswith("addmeter_"), StateFilter(AdminState.editing_meters))
+async def add_meter_start(callback: CallbackQuery, state: FSMContext):
+    """Начало добавления нового счетчика"""
+    company_id = int(callback.data.split("_")[1])
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="❄️ ХВС", callback_data=f"addmtype_1_{company_id}"),
+        InlineKeyboardButton(text="🔥 ГВС", callback_data=f"addmtype_3_{company_id}"),
+        InlineKeyboardButton(text="⚡ Электро", callback_data=f"addmtype_2_{company_id}")
+    )
+    builder.row(InlineKeyboardButton(text="🔙 Назад", callback_data=f"comp_meters_{company_id}"))
+    
+    await callback.message.edit_text(
+        "➕ <b>Добавление счетчика</b>\n\nВыберите тип:",
+        reply_markup=builder.as_markup(),
+        parse_mode=ParseMode.HTML
+    )
+    await callback.answer()
+
+@admin_router.callback_query(F.data.startswith("addmtype_"), StateFilter(AdminState.editing_meters))
+async def add_meter_type_selected(callback: CallbackQuery, state: FSMContext):
+    """Тип счетчика выбран — ожидаем номер"""
+    parts = callback.data.split("_")
+    type_id = int(parts[1])
+    company_id = int(parts[2])
+    type_names = {1: "холодной воды", 2: "электричества", 3: "горячей воды"}
+    
+    await state.update_data(add_meter_type_id=type_id, meters_company_id=company_id)
+    await state.set_state(AdminState.adding_meter_number)
+    
+    await callback.message.edit_text(
+        f"📝 Введите номер счетчика {type_names.get(type_id, '')}:",
+        parse_mode=ParseMode.HTML
+    )
+    await callback.answer()
+
+@admin_router.message(StateFilter(AdminState.adding_meter_number))
+async def process_add_meter_number(message: Message, state: FSMContext, bot: Bot):
+    """Обработка введённого номера нового счетчика"""
+    data = await state.get_data()
+    company_id = data['meters_company_id']
+    type_id = data['add_meter_type_id']
+    number = message.text.strip()
+    
+    if not number or len(number) > 25:
+        await bot.send_message(message.chat.id, "❌ Некорректный номер. Попробуйте ещё раз:")
+        return
+    
+    await new_data_insert(
+        'INSERT INTO us_readings(number_counter, counter_type_id, business_id) VALUES($1, $2, $3)',
+        number, type_id, company_id
+    )
+    
+    await state.set_state(AdminState.editing_meters)
+    
+    # Возвращаемся к списку счетчиков — имитируем нажатие
+    meters_records = await get_data(
+        'SELECT ur.id, ur.number_counter, tc.name FROM us_readings ur '
+        'JOIN type_counter tc ON ur.counter_type_id = tc.id '
+        'WHERE ur.business_id = $1 ORDER BY tc.id',
+        company_id
+    )
+    builder = InlineKeyboardBuilder()
+    if meters_records:
+        for m in meters_records:
+            t = m['name']
+            n = m['number_counter']
+            mid = m['id']
+            icon = "❄️" if t == 'Холодная вода' else ("🔥" if t == 'Горячая вода' else "⚡")
+            label = "ХВС" if t == 'Холодная вода' else ("ГВС" if t == 'Горячая вода' else "Электро")
+            builder.row(
+                InlineKeyboardButton(text=f"{icon} {label}: {n}", callback_data=f"editmeter_{mid}"),
+                InlineKeyboardButton(text="🗑️", callback_data=f"delmeter_{mid}")
+            )
+    builder.row(InlineKeyboardButton(text="➕ Добавить счетчик", callback_data=f"addmeter_{company_id}"))
+    builder.row(InlineKeyboardButton(text="🔙 Назад", callback_data=f"company:{company_id}"))
+    
+    await bot.send_message(
+        message.chat.id,
+        f"✅ Счетчик добавлен: {number}\n\n📊 <b>Управление счетчиками</b>",
+        reply_markup=builder.as_markup(),
+        parse_mode=ParseMode.HTML
+    )
+
+@admin_router.callback_query(F.data.startswith("delmeter_"), StateFilter(AdminState.editing_meters))
+async def delete_meter(callback: CallbackQuery, state: FSMContext):
+    """Удаление счетчика"""
+    meter_id = int(callback.data.split("_")[1])
+    data = await state.get_data()
+    company_id = data['meters_company_id']
+    
+    await new_data_insert('DELETE FROM us_readings WHERE id = $1', meter_id)
+    
+    # Обновляем список
+    meters_records = await get_data(
+        'SELECT ur.id, ur.number_counter, tc.name FROM us_readings ur '
+        'JOIN type_counter tc ON ur.counter_type_id = tc.id '
+        'WHERE ur.business_id = $1 ORDER BY tc.id',
+        company_id
+    )
+    builder = InlineKeyboardBuilder()
+    if meters_records:
+        for m in meters_records:
+            t = m['name']
+            n = m['number_counter']
+            mid = m['id']
+            icon = "❄️" if t == 'Холодная вода' else ("🔥" if t == 'Горячая вода' else "⚡")
+            label = "ХВС" if t == 'Холодная вода' else ("ГВС" if t == 'Горячая вода' else "Электро")
+            builder.row(
+                InlineKeyboardButton(text=f"{icon} {label}: {n}", callback_data=f"editmeter_{mid}"),
+                InlineKeyboardButton(text="🗑️", callback_data=f"delmeter_{mid}")
+            )
+    builder.row(InlineKeyboardButton(text="➕ Добавить счетчик", callback_data=f"addmeter_{company_id}"))
+    builder.row(InlineKeyboardButton(text="🔙 Назад", callback_data=f"company:{company_id}"))
+    
+    await callback.message.edit_text(
+        "🗑️ Счетчик удалён\n\n📊 <b>Управление счетчиками</b>",
+        reply_markup=builder.as_markup(),
+        parse_mode=ParseMode.HTML
+    )
+    await callback.answer("✅ Удалено")
+
+@admin_router.callback_query(F.data.startswith("editmeter_"), StateFilter(AdminState.editing_meters))
+async def edit_meter_start(callback: CallbackQuery, state: FSMContext):
+    """Начало редактирования номера счетчика"""
+    meter_id = int(callback.data.split("_")[1])
+    
+    meter_info = await get_data(
+        'SELECT ur.number_counter, tc.name FROM us_readings ur '
+        'JOIN type_counter tc ON ur.counter_type_id = tc.id WHERE ur.id = $1',
+        meter_id
+    )
+    if not meter_info:
+        await callback.answer("Счетчик не найден!")
+        return
+    
+    await state.update_data(edit_meter_id=meter_id)
+    await state.set_state(AdminState.editing_meter_number)
+    
+    await callback.message.edit_text(
+        f"✏️ <b>Редактирование счетчика</b>\n\n"
+        f"Тип: {meter_info[0]['name']}\n"
+        f"Текущий номер: <code>{meter_info[0]['number_counter']}</code>\n\n"
+        f"Введите новый номер:",
+        parse_mode=ParseMode.HTML
+    )
+    await callback.answer()
+
+@admin_router.message(StateFilter(AdminState.editing_meter_number))
+async def process_edit_meter_number(message: Message, state: FSMContext, bot: Bot):
+    """Обработка нового номера счетчика"""
+    data = await state.get_data()
+    meter_id = data['edit_meter_id']
+    company_id = data['meters_company_id']
+    new_number = message.text.strip()
+    
+    if not new_number or len(new_number) > 25:
+        await bot.send_message(message.chat.id, "❌ Некорректный номер. Попробуйте ещё раз:")
+        return
+    
+    await new_data_insert('UPDATE us_readings SET number_counter = $1 WHERE id = $2', new_number, meter_id)
+    await state.set_state(AdminState.editing_meters)
+    
+    meters_records = await get_data(
+        'SELECT ur.id, ur.number_counter, tc.name FROM us_readings ur '
+        'JOIN type_counter tc ON ur.counter_type_id = tc.id '
+        'WHERE ur.business_id = $1 ORDER BY tc.id',
+        company_id
+    )
+    builder = InlineKeyboardBuilder()
+    if meters_records:
+        for m in meters_records:
+            t = m['name']
+            n = m['number_counter']
+            mid = m['id']
+            icon = "❄️" if t == 'Холодная вода' else ("🔥" if t == 'Горячая вода' else "⚡")
+            label = "ХВС" if t == 'Холодная вода' else ("ГВС" if t == 'Горячая вода' else "Электро")
+            builder.row(
+                InlineKeyboardButton(text=f"{icon} {label}: {n}", callback_data=f"editmeter_{mid}"),
+                InlineKeyboardButton(text="🗑️", callback_data=f"delmeter_{mid}")
+            )
+    builder.row(InlineKeyboardButton(text="➕ Добавить счетчик", callback_data=f"addmeter_{company_id}"))
+    builder.row(InlineKeyboardButton(text="🔙 Назад", callback_data=f"company:{company_id}"))
+    
+    await bot.send_message(
+        message.chat.id,
+        f"✅ Номер обновлён: {new_number}\n\n📊 <b>Управление счетчиками</b>",
+        reply_markup=builder.as_markup(),
+        parse_mode=ParseMode.HTML
+    )
+
+@admin_router.callback_query(F.data.startswith('yesdeletecomp_'), StateFilter(AdminState.company_action))
+@admin_router.callback_query(F.data.startswith('dontdeletecomp_'), StateFilter(AdminState.company_action))
 async def delete_company_check(callback: CallbackQuery, state: FSMContext):
     data = callback.data
     # Формат: yesdeletecomp_{company_id} или dontdeletecomp_{company_id}
@@ -4068,7 +5103,7 @@ async def delete_company_check(callback: CallbackQuery, state: FSMContext):
         await callback.answer()
     
 
-@admin_router.callback_query(F.data.startswith("deletecomp_"))
+@admin_router.callback_query(F.data.startswith("deletecomp_"), StateFilter(AdminState.company_action))
 async def delete_company(callback: CallbackQuery, state: FSMContext):
     company_id = int(callback.data.split("_")[1])
     
@@ -4092,7 +5127,7 @@ async def delete_company(callback: CallbackQuery, state: FSMContext):
     )
     await callback.answer()
 
-@admin_router.callback_query(F.data == "add_company")
+@admin_router.callback_query(F.data == "add_company", StateFilter(AdminState.company_list))
 async def add_company_start(callback: CallbackQuery, state: FSMContext):
     await state.update_data(
         new_company={},
@@ -4140,8 +5175,8 @@ async def process_add_company(message: Message, state: FSMContext, bot: Bot):
             5: ("Дата завершения", "contract_end_date", "Введите <b>дату акта приема-передачи</b> (ДД.ММ.ГГГГ):"),
             6: ("Акт приема-передачи", "acceptance_certificate", "Введите <b>телефон</b> компании:"),
             7: ("Телефон", "phone", "Введите <b>Наименование</b> компании:"),
-            8: ("Наименование компании", "name_company", "Введите ФИО генерального директора"),
-            9: ("ФИО ген директора", "director_name", None)
+            8: ("Наименование компании", "name_company", "Введите <b>ФИО</b>:"),
+            9: ("ФИО", "director_name", None)
         }
         
         field_display, field_key, next_question = steps[current_step]
@@ -4283,7 +5318,7 @@ async def process_add_company(message: Message, state: FSMContext, bot: Bot):
                 except:
                     pass
                 sent_msg = await message.answer(
-                    text=f"<b>Шаг 9/11</b> - Введите <b>ФИО генерального директора</b>:\n\n"
+                    text=f"<b>Шаг 9/11</b> - Введите <b>ФИО</b>:\n\n"
                          f"{error_text}\n"
                          f"Попробуйте снова:",
                     parse_mode=ParseMode.HTML
@@ -4315,7 +5350,12 @@ async def process_add_company(message: Message, state: FSMContext, bot: Bot):
                 reply_markup=keyboard,
                 parse_mode=ParseMode.HTML
             )
-            await state.update_data(new_company=new_company, add_step=10, add_message_id=sent_msg.message_id)
+            await state.update_data(
+                new_company=new_company,
+                add_step=10,
+                add_message_id=sent_msg.message_id,
+                business_forms=[dict(f) for f in business_forms],
+            )
         else:
             # Переход к следующему шагу
             try:
@@ -4349,7 +5389,8 @@ async def process_add_company(message: Message, state: FSMContext, bot: Bot):
         inn = new_company.get('inn')
         sfp_general_direcotr = new_company.get('director_name')
         gen_dir_list = sfp_general_direcotr.split(' ')
-        # ВЫВОД ИНФЫ
+        director_title = new_company.get('director_title')
+        director_title_line = f"\n            👔 <b>Должность:</b> {director_title}" if director_title else ""
         company_info = f"""
             📋 <b>ДАННЫЕ НОВОЙ КОМПАНИИ:</b>
 
@@ -4362,7 +5403,7 @@ async def process_add_company(message: Message, state: FSMContext, bot: Bot):
             📋 <b>Акт приема-передачи:</b> {acceptance_certificate}
             📞 <b>Телефон:</b> {phone}
             🔢 <b>ИНН:</b> {inn}
-            👤 <b>Генеральный директор:</b> {sfp_general_direcotr}
+            👤 <b>ФИО:</b> {sfp_general_direcotr}{director_title_line}
             🏢 <b>Вид деятельности:</b> {activity_type}
         """
         
@@ -4380,8 +5421,8 @@ async def process_add_company(message: Message, state: FSMContext, bot: Bot):
         list_data=[agreement, inn, name_fod, name_company, activity_type, square, list_name, acceptance_certificate, sfp_list[0], sfp_list[1], sfp_list[2], end_agreement, phone]
         await copy_sheet_safe(list_name)
         await safe_add_to_excel(list_data)
-        await new_data_insert('INSERT INTO bussines(name_company, id_form, square, bid, acceptance_certificate, agreement, end_date_agreement, id_type_of_activity, sheet_name,surname,first_name,patronymic) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)', 
-                            name_company, id_form_doing, square, bid, acceptance_certificate, agreement, end_agreement, id_toa, list_name,gen_dir_list[0],gen_dir_list[1],gen_dir_list[2])
+        await new_data_insert('INSERT INTO bussines(name_company, id_form, square, bid, acceptance_certificate, agreement, end_date_agreement, id_type_of_activity, sheet_name, surname, first_name, patronymic, phone, director_title) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)', 
+                            name_company, id_form_doing, square, bid, acceptance_certificate, agreement, end_agreement, id_toa, list_name, gen_dir_list[0], gen_dir_list[1], gen_dir_list[2], phone, director_title)
         
 
         # ========== ИНТЕГРАЦИЯ С НОВЫМ РОУТЕРОМ ==========
@@ -4402,15 +5443,16 @@ async def process_add_company(message: Message, state: FSMContext, bot: Bot):
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="👤 Я", callback_data=f"meter_filler_admin")],
             [InlineKeyboardButton(text="🏢 Арендатор", callback_data="meter_filler_tenant")],
+            [InlineKeyboardButton(text="⏭️ Пропустить (без счетчиков)", callback_data="meter_skip")],
         ])
         
         sent_msg = await message.answer(
             text="✅ <b>Компания успешно создана!</b>\n\n"
-                 "Теперь нужно добавить номера счетчиков:\n"
+                 "Добавить номера счетчиков?\n"
                  "• ❄️ Холодная вода\n"
                  "• 🔥 Горячая вода\n"
                  "• ⚡️ Электричество\n\n"
-                 "<i>Номера можно будет изменить позже в настройках компании.</i>\n\n"
+                 "<i>Номера можно будет добавить позже в настройках компании.</i>\n\n"
                  "Кто будет заполнять номера?",
             parse_mode=ParseMode.HTML,
             reply_markup=keyboard
@@ -4427,22 +5469,7 @@ async def process_add_company(message: Message, state: FSMContext, bot: Bot):
         # Устанавливаем состояние выбора заполнителя (из вашего admin_states.py)
         await state.set_state(AdminState.meter_filler_choice)
         
-        # ========== КОНЕЦ ИНТЕГРАЦИИ ==========
-
-        # await state.set_state(AdminState.company_list)
-        # keyboard = await create_companies_keyboard()
-        
-        # from main import bot
-        # await bot.edit_message_text(
-        #     chat_id=message.chat.id,
-        #     message_id=add_message_id,
-        #     text=company_info,
-        #     reply_markup=keyboard,
-        #     parse_mode=ParseMode.HTML
-        # )
-        
-        # # Очищаем состояние
-        # await state.clear()
+        await state.set_state(AdminState.meter_filler_choice)
 
 
 @admin_router.callback_query(F.data.startswith("form:"))
@@ -4460,94 +5487,56 @@ async def select_business_form(callback: CallbackQuery, state: FSMContext):
         await bot.delete_message(chat_id=callback.message.chat.id, message_id=add_message_id)
     except:
         pass
-        
-    sent_msg = await callback.message.answer(
-        text=f"✅ <b>Форма бизнеса</b> выбрана!\n\n"
-             f"<b>Шаг 11/11</b> - Введите <b>вид деятельности</b>:",
-        parse_mode=ParseMode.HTML
-    )
-    
-    await state.update_data(new_company=new_company, add_step=10, add_message_id=sent_msg.message_id)  # меняем на 10
+
+    if form_id == 1:
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Генеральный директор", callback_data="director_title:Генеральный директор")],
+            [InlineKeyboardButton(text="Директор", callback_data="director_title:Директор")],
+            [InlineKeyboardButton(text="🔙 Назад к формам", callback_data="back_to_forms")],
+        ])
+        sent_msg = await callback.message.answer(
+            text=f"✅ <b>Форма бизнеса</b> выбрана!\n\n"
+                 f"<b>Шаг 11/12</b> - Выберите <b>должность руководителя</b>:",
+            reply_markup=keyboard,
+            parse_mode=ParseMode.HTML
+        )
+        await state.update_data(new_company=new_company, add_message_id=sent_msg.message_id)
+    else:
+        sent_msg = await callback.message.answer(
+            text=f"✅ <b>Форма бизнеса</b> выбрана!\n\n"
+                 f"<b>Шаг 11/11</b> - Введите <b>вид деятельности</b>:",
+            parse_mode=ParseMode.HTML
+        )
+        await state.update_data(new_company=new_company, add_step=10, add_message_id=sent_msg.message_id)
     await callback.answer()
 
 
+@admin_router.callback_query(F.data.startswith("director_title:"))
+async def select_director_title(callback: CallbackQuery, state: FSMContext):
+    title = callback.data.split(":", 1)[1]
 
-
-
-
-# await new_data_insert('INSERT INTO type_of_activity (name) VALUES ($1)) ON CONFLICT (name) DO NOTHING', activity_type)
-#         records = await get_data('SELECT id FROM type_of_activity WHERE name = $1 LIMIT 1',activity_type)
-#         id_toa = {rec['id'] for rec in records}
-#         # ДОБАВИТЬ ЛОГИКУ СОЗДАНИЯ КОПИИ EXCEL листа
-#         list_name = f'K{square}'
-#         await copy_sheet_safe(list_name)
-#         await new_data_insert('INSERT INTO bussines(name_company, id_form, square, bid, acceptance_certificate, agreement, end_date_agreement, id_type_of_activity) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)', name_company, id_form_doing, square, bid, acceptance_certificate, agreement, end_agreement, id_toa)
-#         await state.set_state(AdminState.company_list)
-
-@admin_router.callback_query(F.data.startswith("activity:"))
-async def select_activity_type(callback: CallbackQuery, state: FSMContext):
-    activity_id = int(callback.data.split(":")[1])
-    
     data = await state.get_data()
     new_company = data.get("new_company", {})
-    
-    new_company['id_type_of_activity'] = activity_id
-    
-    await state.update_data(new_company=new_company)
-    
-    # ВЫВОД ВСЕХ ДАННЫХ ДЛЯ СОХРАНЕНИЯ
-    company_info = f"""
-    📋 <b>ДАННЫЕ ДЛЯ СОХРАНЕНИЯ В БД:</b>
-    
-    <b>Наименование компании:</b> {new_company.get('name_company')}
-    <b>Форма бизнеса ID:</b> {new_company.get('id_form')}
-    <b>Площадь:</b> {new_company.get('square')} кв.м
-    <b>Ставка аренды:</b> {new_company.get('bid')} руб
-    <b>Номер договора:</b> {new_company.get('agreement')}
-    <b>Дата завершения договора:</b> {new_company.get('contract_end_date')}
-    <b>Акт приема-передачи:</b> {new_company.get('acceptance_certificate')}
-    <b>Телефон:</b> {new_company.get('phone')}
-    <b>Генеральный директор:</b> {new_company.get('director_name')}
-    <b>Вид деятельности ID:</b> {new_company.get('id_type_of_activity')}
-    """
-    
-    # Здесь будет ваш код сохранения в БД
-    # insert_query = """
-    # INSERT INTO Bussines 
-    # (name_company, square, bid, agreement, contract_end_date, 
-    #  acceptance_certificate, phone, director_name, id_form, id_type_of_activity)
-    # VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-    # """
-    # await get_data(insert_query,
-    #     new_company['name_company'],
-    #     new_company['square'],
-    #     new_company['bid'],
-    #     new_company['agreement'],
-    #     new_company['contract_end_date'],
-    #     new_company['acceptance_certificate'],
-    #     new_company['phone'],
-    #     new_company['director_name'],
-    #     new_company['id_form'],
-    #     new_company['id_type_of_activity']
-    # )
-    
-    await state.set_state(AdminState.company_list)
-    keyboard = await create_companies_keyboard()
-    
-    companies = await get_companies_from_db()
-    if not companies:
-        text = f"✅ <b>Компания добавлена!</b>\n\nКомпания <b>{new_company['name_company']}</b> успешно добавлена.\n\n👑 <b>Админ-панель: Управление компаниями</b>\n\n📭 <i>Компаний пока нет</i>\n\nДобавьте новую компанию:"
-    else:
-        text = f"✅ <b>Компания добавлена!</b>\n\nКомпания <b>{new_company['name_company']}</b> успешно добавлена.\n\n👑 <b>Админ-панель: Управление компаниями</b>\n\nВыберите компанию для управления:"
-    
-    # Выводим информацию о собранных данных перед сохранением
-    await callback.message.edit_text(
-        text=company_info + "\n\n" + text,
-        reply_markup=keyboard,
+    add_message_id = data.get("add_message_id")
+
+    new_company['director_title'] = title
+
+    from main import bot
+    try:
+        await bot.delete_message(chat_id=callback.message.chat.id, message_id=add_message_id)
+    except:
+        pass
+
+    sent_msg = await callback.message.answer(
+        text=f"✅ <b>Должность руководителя</b> выбрана: {title}\n\n"
+             f"<b>Шаг 12/12</b> - Введите <b>вид деятельности</b>:",
         parse_mode=ParseMode.HTML
     )
-    
+    await state.update_data(new_company=new_company, add_step=10, add_message_id=sent_msg.message_id)
     await callback.answer()
+
+
+
 
 @admin_router.callback_query(F.data == "back_to_forms")
 async def back_to_forms(callback: CallbackQuery, state: FSMContext):
@@ -4574,10 +5563,13 @@ async def tenants_keyboard(list_ended_tenant, page: int = 0):
     print(f'Проверка при вызове функции {list_ended_tenant}')
     query = """
     SELECT b.name_company, b.id
-    FROM bussines b 
+    FROM bussines b
+    WHERE EXISTS (
+        SELECT 1 FROM us_readings ur WHERE ur.business_id = b.id
+    )
     ORDER BY b.name_company
     """
-    users = await get_data(query) 
+    users = await get_data(query)
 
     tenants_per_page = 8
     
@@ -4759,7 +5751,7 @@ async def tenants_pagination(call: CallbackQuery, state: FSMContext):
 
 @admin_router.callback_query(F.data.startswith("admin_edit_tariff_"), StateFilter(AdminState.editing_data))
 async def edit_tariff_start(call: CallbackQuery, state: FSMContext, bot: Bot):
-    """Начать редактирование тарифа холодной воды"""
+    """Начать редактирование ставки холодной воды"""
     edit_type = call.data.replace("admin_edit_tariff_", "")
     
     global collected_data
@@ -4781,9 +5773,9 @@ async def edit_tariff_start(call: CallbackQuery, state: FSMContext, bot: Bot):
     await edit_admin_message(
         bot,
         call.message.message_id,
-        f"✏️ Редактирование тарифа\n\n"
+        f"✏️ Редактирование ставки\n\n"
         f"Текущее значение: {current_tariff} руб./м³\n\n"
-        f"Введите новый тариф (в рублях за м³):\n"
+        f"Введите новую ставку (в рублях за м³):\n"
         f"(например: 45.50)",
         reply_markup=cancel_keyboard(with_edit_option=True),
         parse_mode="HTML"
@@ -4791,13 +5783,15 @@ async def edit_tariff_start(call: CallbackQuery, state: FSMContext, bot: Bot):
     await call.answer()
 
 
-# Обработчик для РЕДАКТИРОВАНИЯ тарифа
+# Обработчик для РЕДАКТИРОВАНИЯ ставки
 @admin_router.message(StateFilter(AdminState.waiting_for_tariff_edit))
 async def process_tariff_edit_input(message: Message, state: FSMContext, bot: Bot):
-    """Обработка введенного тарифа при РЕДАКТИРОВАНИИ"""
+    """Обработка введенной ставки при РЕДАКТИРОВАНИИ"""
     if message.chat.id != ADMIN_CHAT_ID:
         return
-    
+    if not message.text:
+        return
+
     raw_text = message.text.replace(",", ".")
     
     try:
@@ -4805,10 +5799,11 @@ async def process_tariff_edit_input(message: Message, state: FSMContext, bot: Bo
         if tariff < 0:
             raise ValueError
     except ValueError:
+        await _admin_try_delete_user_message(bot, message)
         await send_to_admin_topic(
             bot,
             "⚠️ Ошибка ввода\n\n"
-            "Пожалуйста, введите корректный тариф (положительное число).",
+            "Пожалуйста, введите корректную ставку (положительное число).",
             reply_markup=cancel_keyboard()
         )
         return
@@ -4817,7 +5812,7 @@ async def process_tariff_edit_input(message: Message, state: FSMContext, bot: Bo
     edit_type = data.get("edit_type")
     last_msg_id = data.get("last_msg_id")  # Получаем ID последнего сообщения бота
     
-    # Сохраняем тариф
+    # Сохраняем ставку
     global collected_data
     if edit_type not in collected_data:
         collected_data[edit_type] = {}
@@ -4832,8 +5827,8 @@ async def process_tariff_edit_input(message: Message, state: FSMContext, bot: Bo
     
     builder = InlineKeyboardBuilder()
     
-    # Для холодной воды - только тариф
-    builder.button(text="💰 Редактировать тариф", callback_data=f"admin_edit_tariff_{edit_type}")
+    # Для холодной воды - только ставка
+    builder.button(text="💰 Редактировать ставку", callback_data=f"admin_edit_tariff_{edit_type}")
     builder.button(text="🔙 Назад к списку", callback_data="admin_edit_menu")
     builder.adjust(1)
     
@@ -4845,10 +5840,10 @@ async def process_tariff_edit_input(message: Message, state: FSMContext, bot: Bo
             await bot.edit_message_text(
                 chat_id=ADMIN_CHAT_ID,
                 message_id=last_msg_id,
-                text=f"✅ Тариф обновлен!\n\n"
+                text=f"✅ Ставка обновлена!\n\n"
                      f"✏️ Редактирование показаний {label}\n\n"
                      f"Текущие значения:\n"
-                     f"• Тариф: {type_data.get('tariff', '—')} руб./м³\n\n"
+                     f"• Ставка: {type_data.get('tariff', '—')} руб./м³\n\n"
                      f"Что вы хотите изменить?",
                 reply_markup=builder.as_markup(),
                 parse_mode="HTML"
@@ -4858,10 +5853,10 @@ async def process_tariff_edit_input(message: Message, state: FSMContext, bot: Bo
             # Если не получилось отредактировать, отправляем новое сообщение
             new_msg = await bot.send_message(
                 chat_id=ADMIN_CHAT_ID,
-                text=f"✅ Тариф обновлен!\n\n"
+                text=f"✅ Ставка обновлена!\n\n"
                      f"✏️ Редактирование показаний {label}\n\n"
                      f"Текущие значения:\n"
-                     f"• Тариф: {type_data.get('tariff', '—')} руб./м³\n\n"
+                     f"• Ставка: {type_data.get('tariff', '—')} руб./м³\n\n"
                      f"Что вы хотите изменить?",
                 reply_markup=builder.as_markup(),
                 parse_mode="HTML"
@@ -4871,21 +5866,17 @@ async def process_tariff_edit_input(message: Message, state: FSMContext, bot: Bo
         # Если нет last_msg_id, отправляем новое сообщение
         new_msg = await bot.send_message(
             chat_id=ADMIN_CHAT_ID,
-            text=f"✅ Тариф обновлен!\n\n"
+            text=f"✅ Ставка обновлена!\n\n"
                  f"✏️ Редактирование показаний {label}\n\n"
                  f"Текущие значения:\n"
-                 f"• Тариф: {type_data.get('tariff', '—')} руб./м³\n\n"
+                 f"• Ставка: {type_data.get('tariff', '—')} руб./м³\n\n"
                  f"Что вы хотите изменить?",
             reply_markup=builder.as_markup(),
             parse_mode="HTML"
         )
         await state.update_data(last_msg_id=new_msg.message_id)
     
-    # Удаляем сообщение с вводом
-    try:
-        await bot.delete_message(ADMIN_CHAT_ID, message.message_id)
-    except:
-        pass
+    await _admin_try_delete_user_message(bot, message)
 
 
 @admin_router.callback_query(F.data.startswith("tenant_"), StateFilter(AdminState.selecting_tenant))
@@ -4901,46 +5892,20 @@ async def tenant_selected(call: CallbackQuery, state: FSMContext):
         selected_tenant_name=name_company if name_company else "Неизвестный"
     )
     
-    await state.set_state(AdminState.waiting_for_heat_volume)
+    await state.set_state(AdminState.waiting_for_heat_amount)
     
     await edit_admin_message(
         bot,
         call.message.message_id,
         f"🔥 Отопление - {name_company}\n\n"
-        f"Введите показания счетчика отопления (целое число):",
+        f"Введите сумму с НДС (в рублях):\n"
+        f"(например: 1250.75)",
         parse_mode="HTML"
     )
     await call.answer()
 
 
-@admin_router.message(StateFilter(AdminState.waiting_for_heat_volume))
-async def heat_volume_input(message: Message, state: FSMContext, bot: Bot):
-    from main import bot
-    try:
-        volume = int(message.text.strip())
-    except ValueError:
-        await message.answer(
-            "❌ Пожалуйста, введите целое число!\n"
-            "Попробуйте еще раз:",
-        )
-        return
-    if len(str(volume))<12:
-        await state.update_data(heat_volume=volume)
-        await state.set_state(AdminState.waiting_for_heat_amount)
-        
-        data = await state.get_data()
-        tenant_name = data.get('selected_tenant_name', 'Арендатор')
-        
-        await message.answer(
-            f"✅ Показания: {volume}\n\n"
-            f"🔥 Отопление - {tenant_name}\n"
-            f"Введите сумму с НДС (в рублях):\n"
-            f"(например: 1250.75)",
-        )
-    else:
-        await message.answer(
-            f"Пожалуйста введите корректное значение"
-        )
+# heat_volume_input удалён — ввод показаний счётчика для отопления больше не используется (треб. 18)
 
 
 
@@ -4960,26 +5925,77 @@ async def heat_amount_input(message: Message, state: FSMContext, bot: Bot):
         )
         return
     if len(str_len)<14:
-        await state.update_data(heat_amount=amount)
+        await state.update_data(heat_amount=amount, heat_volume=0) # Обнуляем объем (треб. 18)
+        await state.set_state(AdminState.waiting_for_unexpected_individual)
         
         data = await state.get_data()
         tenant_name = data.get('selected_tenant_name', 'Арендатор')
-        tenant_id = data.get('selected_tenant_id')
-        volume = data.get('heat_volume')
-        
-        await state.set_state(AdminState.confirming_readings)
         
         await message.answer(
-            f"📊 Проверьте введенные данные:\n\n"
-            f"Арендатор: {tenant_name}\n"
-            f"Услуга: 🔥 Отопление\n"
-            f"Показания: {volume}\n"
-            f"Сумма: {amount:.2f} ₽\n\n"
-            f"Сохранить или отредактировать?",
-            reply_markup=confirm_readings_keyboard(tenant_id)
+            f"✅ Сумма отопления: {amount} руб.\n\n"
+            f"💰 <b>Непредвиденные расходы</b> - {tenant_name}\n"
+            f"Введите сумму (в рублях) или 0 если их нет:\n"
+            f"(например: 500)",
+            parse_mode="HTML"
         )
     else:
         await message.answer('Пожалуйста введите корректное значение')
+
+
+@admin_router.message(StateFilter(AdminState.waiting_for_unexpected_individual))
+async def unexpected_individual_input(message: Message, state: FSMContext, bot: Bot):
+    """Ввод индивидуальных непредвиденных расходов"""
+    try:
+        amount = float(message.text.strip().replace(',', '.'))
+        amount = round(amount, 2)
+    except ValueError:
+        await message.answer("❌ Пожалуйста, введите корректную сумму (например: 500.00).")
+        return
+        
+    await state.update_data(unexpected_individual=amount)
+    await state.set_state(AdminState.waiting_for_expl_individual)
+    
+    data = await state.get_data()
+    tenant_name = data.get('selected_tenant_name', 'Арендатор')
+    
+    await message.answer(
+        f"✅ Непредвиденные расходы: {amount} руб.\n\n"
+        f"🏢 <b>Эксплуатационные услуги</b> - {tenant_name}\n"
+        f"Введите сумму (в рублях) или 0 если их нет:\n"
+        f"(например: 1200)",
+        parse_mode="HTML"
+    )
+
+
+@admin_router.message(StateFilter(AdminState.waiting_for_expl_individual))
+async def expl_individual_input(message: Message, state: FSMContext, bot: Bot):
+    """Ввод индивидуальных эксплуатационных услуг"""
+    try:
+        amount = float(message.text.strip().replace(',', '.'))
+        amount = round(amount, 2)
+    except ValueError:
+        await message.answer("❌ Пожалуйста, введите корректную сумму (например: 1200.00).")
+        return
+        
+    await state.update_data(expl_individual=amount)
+    await state.set_state(AdminState.confirming_readings)
+    
+    data = await state.get_data()
+    tenant_name = data.get('selected_tenant_name', 'Арендатор')
+    tenant_id = data.get('selected_tenant_id')
+    heat_amount = data.get('heat_amount', 0)
+    unexpected = data.get('unexpected_individual', 0)
+    
+    await message.answer(
+        f"📊 <b>Проверьте введенные данные:</b>\n\n"
+        f"🏢 Арендатор: {tenant_name}\n"
+        f"🔥 Отопление: {heat_amount:.2f} ₽\n"
+        f"💰 Непредвиденные: {unexpected:.2f} ₽\n"
+        f"🏢 Эксплуатация: {amount:.2f} ₽\n\n"
+        f"Все верно?",
+        reply_markup=confirm_readings_keyboard(tenant_id),
+        parse_mode="HTML"
+    )
 
 
 @admin_router.callback_query(F.data.startswith("savetenant_readings_"), StateFilter(AdminState.confirming_readings))
@@ -4992,11 +6008,13 @@ async def save_readings(call: CallbackQuery, state: FSMContext):
     
     tenant_id = int(call.data.split("_")[2])
     data = await state.get_data()
-    volume = data['heat_volume']
-    amount = data['heat_amount']
+    volume = data.get('heat_volume', 0)
+    amount = data.get('heat_amount', 0)
+    unexpected = data.get('unexpected_individual', 0)
+    expl = data.get('expl_individual', 0)
     
     # Сохраняем показания арендатора
-    await add_tenant_for_user(tenant_id, volume=volume, amount=amount)
+    await add_tenant_for_user(tenant_id, volume=volume, amount=amount, exploitation=expl, unexpected=unexpected)
     
     # Обновляем список обработанных арендаторов
     data = await state.get_data()
@@ -5007,10 +6025,11 @@ async def save_readings(call: CallbackQuery, state: FSMContext):
     new_items = new_data.get('list_tenant', [])
     await state.set_state(AdminState.selecting_tenant)
     
-    # Получаем список всех арендаторов из БД
+    # Получаем список арендаторов из БД (только те, у кого есть счётчики)
     query = """
     SELECT b.id
-    FROM bussines b 
+    FROM bussines b
+    WHERE EXISTS (SELECT 1 FROM us_readings ur WHERE ur.business_id = b.id)
     ORDER BY b.name_company
     """
     users_records = await get_data(query) 
@@ -5043,12 +6062,11 @@ async def save_readings(call: CallbackQuery, state: FSMContext):
     collected_data['heating'] = {'volume': 0, 'amount': 0}
 
     # Проверяем остальные показатели
-    required = ['electro', 'water_cold', 'expl', 'drainage']
+    required = ['electro', 'water_cold', 'drainage']
     missing = []
     names = {
         'electro': '⚡ Электроэнергия',
         'water_cold': '🚰 Холодная вода',
-        'expl': '🏢 Комм. услуги',
         'drainage': '💧 Водоотведение'
     }
 
@@ -5083,7 +6101,6 @@ async def save_readings(call: CallbackQuery, state: FSMContext):
     display_names = {
         'electro': '⚡ Электроэнергия',
         'water_cold': '🚰 Холодная вода',
-        'expl': '🏢 Комм. услуги',
         'drainage': '💧 Водоотведение'
     }
     
@@ -5094,8 +6111,8 @@ async def save_readings(call: CallbackQuery, state: FSMContext):
             report += f"{label}\n"
             
             if req == 'water_cold':
-                report += f"• Тариф: {data.get('tariff', 0)} руб./м³\n\n"
-            elif req in ['expl', 'drainage']:
+                report += f"• Ставка: {data.get('tariff', 0)} руб./м³\n\n"
+            elif req == 'drainage':
                 report += f"• Сумма: {data.get('amount', 0)} руб.\n\n"
             else:  # electro
                 report += f"• Объем: {data.get('volume', 0)}\n"
@@ -5103,7 +6120,6 @@ async def save_readings(call: CallbackQuery, state: FSMContext):
     
     # Кнопки для выбора
     builder = InlineKeyboardBuilder()
-    builder.button(text="💰 Непредвиденные расходы", callback_data="admin_unexpected_expenses")
     builder.button(text="📎 Прикрепить документы", callback_data="admin_attach_documents")
     builder.button(text="✅ Отправить", callback_data="admin_final_save")
     builder.button(text="❌ Отмена", callback_data="admin_cancel")
@@ -5427,3 +6443,158 @@ async def back_to_tenant_selection(call: CallbackQuery, state: FSMContext):
         parse_mode="HTML"
     )
     await call.answer()
+
+
+# ── /rip_id — удаление пользователя (отвязка от компании) ──────────────
+
+RIP_PER_PAGE = 8
+
+
+async def _build_rip_user_list(page: int = 0) -> Tuple[str, InlineKeyboardMarkup]:
+    query = """
+    SELECT u.user_id, u.username, u.first_name, u.second_name,
+           b.name_company
+    FROM users u
+    LEFT JOIN bussines b ON b.id = u.id_business
+    ORDER BY b.name_company NULLS LAST, u.user_id
+    """
+    users = await get_data(query) or []
+    total = len(users)
+
+    if total == 0:
+        builder = InlineKeyboardBuilder()
+        builder.row(InlineKeyboardButton(text="🔙 Закрыть", callback_data="rip_close"))
+        return "🗑 <b>Удаление пользователя</b>\n\nНет зарегистрированных пользователей.", builder.as_markup()
+
+    start = page * RIP_PER_PAGE
+    end = start + RIP_PER_PAGE
+    page_users = users[start:end]
+    total_pages = (total + RIP_PER_PAGE - 1) // RIP_PER_PAGE
+
+    builder = InlineKeyboardBuilder()
+    for u in page_users:
+        uid = u["user_id"]
+        company = u.get("name_company") or "без компании"
+        uname = u.get("username") or ""
+        label = f"{company}"
+        if uname:
+            label += f" (@{uname})"
+        if len(label) > 40:
+            label = label[:38] + "…"
+        builder.row(InlineKeyboardButton(text=label, callback_data=f"ripusr:{uid}"))
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"rippage_{page - 1}"))
+    nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
+    if end < total:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"rippage_{page + 1}"))
+    if nav:
+        builder.row(*nav)
+    builder.row(InlineKeyboardButton(text="🔙 Закрыть", callback_data="rip_close"))
+
+    text = f"🗑 <b>Удаление пользователя</b> ({total})\n\nВыберите пользователя для удаления:"
+    return text, builder.as_markup()
+
+
+@admin_router.message(Command("rip_id"))
+async def rip_id_command(message: Message, state: FSMContext):
+    if not await has_admin_access(message.from_user.id):
+        await message.answer("⛔ Доступ запрещен.")
+        return
+
+    await state.clear()
+    await state.set_state(AdminState.rip_id_list)
+    text, kb = await _build_rip_user_list(0)
+    await message.answer(text=text, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+
+@admin_router.callback_query(F.data.startswith("rippage_"), StateFilter(AdminState.rip_id_list))
+async def rip_page(callback: CallbackQuery, state: FSMContext):
+    page = int(callback.data.split("_")[1])
+    text, kb = await _build_rip_user_list(page)
+    await callback.message.edit_text(text=text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    await callback.answer()
+
+
+@admin_router.callback_query(F.data.startswith("ripusr:"), StateFilter(AdminState.rip_id_list))
+async def rip_user_selected(callback: CallbackQuery, state: FSMContext):
+    user_id = callback.data.split(":")[1]
+
+    query = """
+    SELECT u.user_id, u.username, u.first_name, u.second_name, u.patronymic,
+           u.phone_number, b.name_company
+    FROM users u
+    LEFT JOIN bussines b ON b.id = u.id_business
+    WHERE u.user_id = $1
+    """
+    rows = await get_data(query, user_id)
+    if not rows:
+        await callback.answer("Пользователь не найден", show_alert=True)
+        return
+
+    u = dict(rows[0])
+    fio_parts = [
+        str(u.get("second_name") or "").strip(),
+        str(u.get("first_name") or "").strip(),
+        str(u.get("patronymic") or "").strip(),
+    ]
+    fio = " ".join(p for p in fio_parts if p) or "не указано"
+    uname = u.get("username") or "не указан"
+    company = u.get("name_company") or "не привязан"
+
+    lines = [
+        "🗑 <b>Подтверждение удаления</b>\n",
+        f"🆔 <b>Telegram ID:</b> <code>{u['user_id']}</code>",
+        f"📱 <b>Username:</b> @{uname}" if uname != "не указан" else f"📱 <b>Username:</b> {uname}",
+        f"👤 <b>ФИО:</b> {fio}",
+        f"🏢 <b>Компания:</b> {company}",
+        "\n⚠️ <b>Вы уверены, что хотите удалить этого пользователя?</b>\n"
+        "<i>Пользователь сможет заново пройти регистрацию.</i>",
+    ]
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"ripconfirm:{user_id}"),
+            InlineKeyboardButton(text="❌ Отмена", callback_data="ripcancel"),
+        ],
+    ])
+
+    await state.set_state(AdminState.rip_id_confirm)
+    await callback.message.edit_text(
+        text="\n".join(lines),
+        reply_markup=kb,
+        parse_mode=ParseMode.HTML,
+    )
+    await callback.answer()
+
+
+@admin_router.callback_query(F.data.startswith("ripconfirm:"), StateFilter(AdminState.rip_id_confirm))
+async def rip_confirm(callback: CallbackQuery, state: FSMContext):
+    user_id = callback.data.split(":")[1]
+
+    result = await new_data_insert('DELETE FROM users WHERE user_id = $1', user_id)
+    if result is None:
+        await callback.answer("Ошибка при удалении", show_alert=True)
+        return
+
+    await state.set_state(AdminState.rip_id_list)
+    text, kb = await _build_rip_user_list(0)
+    header = f"✅ Пользователь <code>{user_id}</code> удалён.\n\n"
+    await callback.message.edit_text(text=header + text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    await callback.answer()
+
+
+@admin_router.callback_query(F.data == "ripcancel", StateFilter(AdminState.rip_id_confirm))
+async def rip_cancel(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminState.rip_id_list)
+    text, kb = await _build_rip_user_list(0)
+    await callback.message.edit_text(text=text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    await callback.answer()
+
+
+@admin_router.callback_query(F.data == "rip_close", StateFilter(AdminState.rip_id_list))
+async def rip_close(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text("🗑 Удаление пользователя — завершено.")
+    await callback.answer()

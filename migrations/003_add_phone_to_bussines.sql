@@ -1,0 +1,5 @@
+BEGIN;
+
+ALTER TABLE bussines ADD COLUMN IF NOT EXISTS phone text;
+
+COMMIT;

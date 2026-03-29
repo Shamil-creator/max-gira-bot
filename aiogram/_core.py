@@ -49,6 +49,7 @@ class Bot:
     def __init__(self, token: str, session=None):
         self._max_bot = MaxBot(token=token)
         self.session = SimpleNamespace(close=self._max_bot.close_session)
+        self.id = 0
         self._id_seq = itertools.count(1)
         self._mid_to_int: dict[str, int] = {}
         self._int_to_mid: dict[int, str] = {}
@@ -348,7 +349,8 @@ class Bot:
         mid = self._resolve_mid(message_id)
         try:
             await self._max_bot.delete_message(message_id=mid)
-        except Exception:
+        except Exception as exc:
+            logger.warning("MAX bridge: delete_message failed mid=%r chat_id=%r: %s", mid, chat_id, exc)
             return None
 
     async def delete_webhook(self, drop_pending_updates=True):
@@ -475,7 +477,25 @@ class Router:
         return True
 
     async def _call(self, func, event_obj, memory_context):
-        fsm = FSMContext(memory_context)
+        global_storage = None
+        storage_key = None
+        try:
+            from .fsm.storage.base import StorageKey
+            if self._bot is not None and hasattr(self._bot, "_dispatcher_ref"):
+                dp = self._bot._dispatcher_ref
+                if dp is not None and hasattr(dp, "fsm"):
+                    global_storage = dp.fsm.storage
+                    user_id = getattr(getattr(event_obj, "from_user", None), "id", 0)
+                    chat_id = user_id
+                    if hasattr(event_obj, "chat"):
+                        chat_id = getattr(event_obj.chat, "id", user_id)
+                    elif hasattr(event_obj, "message") and hasattr(event_obj.message, "chat"):
+                        chat_id = getattr(event_obj.message.chat, "id", user_id)
+                    storage_key = StorageKey(bot_id=self._bot.id, chat_id=int(chat_id), user_id=int(user_id))
+        except Exception:
+            pass
+
+        fsm = FSMContext(memory_context, global_storage=global_storage, storage_key=storage_key)
         signature = inspect.signature(func)
         params = list(signature.parameters.keys())
 
@@ -504,6 +524,10 @@ class Dispatcher:
         self._routers: list[Router] = []
         self._on_startup = None
         self.startup = _StartupRegister(self)
+
+        from .fsm.storage.base import BaseStorage
+        _storage = storage if storage is not None else BaseStorage()
+        self.fsm = SimpleNamespace(storage=_storage)
 
         @self._bridge_router.message_created()
         async def _on_message(event: Any, context: Any):
@@ -549,6 +573,7 @@ class Dispatcher:
         self._routers.extend(routers)
 
     async def start_polling(self, bot: Bot):
+        bot._dispatcher_ref = self
         for router in self._routers:
             router._bot = bot
 

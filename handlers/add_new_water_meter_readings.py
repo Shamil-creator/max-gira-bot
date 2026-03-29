@@ -1,5 +1,6 @@
 from datetime import datetime
 import tempfile
+from html import escape
 from docx import Document
 from aiogram import Bot, types, Router
 from aiogram.types import Message, CallbackQuery
@@ -22,23 +23,29 @@ from states.auth_states import Auth_States
 add_new_mr_router = Router()
 
 async def get_data(query: str, *params):
+    conn = None
     try:
         conn = await asyncpg.connect(config.db_connection)
-        result = await conn.fetch(query,*params)
-        await conn.close()
-        return result
-    except Exception as e: 
-        print(f"Ошибка: {e}")
-        return None
-    
-async def new_data_insert(query: str, *params):
-    try:
-        conn = await asyncpg.connect(config.db_connection)
-        result = await conn.execute(query,*params)
-        return result
+        return await conn.fetch(query, *params)
     except Exception as e:
         print(f"Ошибка: {e}")
         return None
+    finally:
+        if conn:
+            await conn.close()
+
+async def new_data_insert(query: str, *params):
+    conn = None
+    try:
+        conn = await asyncpg.connect(config.db_connection)
+        return await conn.execute(query, *params)
+    except Exception as e:
+        print(f"Ошибка: {e}")
+        return None
+    finally:
+        if conn:
+            await conn.close()
+
     
 async def get_sheet_name(id_us):
     results = await get_data('SELECT sheets_name FROM users WHERE User_Id = $1',str(id_us))
@@ -189,7 +196,7 @@ async def set_new_value(numbers,sheet_name):
 
 @add_new_mr_router.callback_query(F.data.in_(['selected_mr_cw_add','selected_mr_hw_add','add_hoc_go_back_cb']))
 async def callback(call: CallbackQuery, state: FSMContext):
-    from handlers.run import get_menu_keyboard
+    from handlers.run import build_menu_keyboard
     data = call.data
     await call.message.delete()
     if data == 'selected_mr_cw_add':
@@ -200,12 +207,12 @@ async def callback(call: CallbackQuery, state: FSMContext):
         await call.message.answer('Введите номер счетчика ГОРЯЧЕЙ воды')
     elif data == 'add_hoc_go_back_cb':
         await state.set_state(Auth_States.menu_state)
-        await call.message.answer('Вы в меню', reply_markup=get_menu_keyboard())
+        await call.message.answer('Вы в меню', reply_markup=await build_menu_keyboard(call.from_user.id))
 
 @add_new_mr_router.callback_query(F.data.in_(['add_more','finish_input', 'save_mr_w', 'redact_mr_w','restart_mr_w']))
 async def callback(call: CallbackQuery, state: FSMContext):
     from main import redis as r
-    from handlers.run import get_menu_keyboard
+    from handlers.run import build_menu_keyboard
     from handlers.reg_user import smart_add_keyboard
     data = call.data
     id_us = call.message.chat.id
@@ -270,10 +277,10 @@ async def callback(call: CallbackQuery, state: FSMContext):
             try:
                 await set_new_value(all_mr,sheet_name)
                 await state.set_state(Auth_States.menu_state)
-                await call.message.answer('Вы в меню', reply_markup=get_menu_keyboard())
+                await call.message.answer('Вы в меню', reply_markup=await build_menu_keyboard(id_us))
             except Exception as e:
                 await state.set_state(Auth_States.menu_state)
-                await call.message.answer('Вы в меню', reply_markup=get_menu_keyboard())
+                await call.message.answer('Вы в меню', reply_markup=await build_menu_keyboard(id_us))
         else:
             keyboard = await smart_add_keyboard(id_us)
             await call.message.answer('Вы в меню, сохранили ваш счетчик', reply_markup=keyboard)
@@ -306,20 +313,26 @@ async def get_message(msg: Message, state: FSMContext):
 @add_new_mr_router.callback_query(F.data.startswith('mr_cw_'))
 async def cq(call: CallbackQuery, state: FSMContext):
     data = call.data
-    number_edit = data[6:]
+    number_edit = '_'.join(data.split('_')[2:])
     await state.update_data(edit_mr_w = number_edit)
     await call.message.delete()
     await state.set_state(Meter_Readings_States.edit_mr_cw)
-    await call.message.answer('Введите пожалуйста новое значение')
+    await call.message.answer(
+        f'Введите новое значение для счётчика холодной воды № <b>{escape(str(number_edit))}</b>',
+        parse_mode='HTML',
+    )
 
 @add_new_mr_router.callback_query(F.data.startswith('mr_hw_'))
 async def cq(call: CallbackQuery, state: FSMContext):
     data = call.data
-    number_edit = data[6:]
+    number_edit = '_'.join(data.split('_')[2:])
     await state.update_data(edit_mr_w = number_edit)
     await call.message.delete()
     await state.set_state(Meter_Readings_States.edit_mr_hw)
-    await call.message.answer('Введите пожалуйста новое значение')
+    await call.message.answer(
+        f'Введите новое значение для счётчика горячей воды № <b>{escape(str(number_edit))}</b>',
+        parse_mode='HTML',
+    )
 
 @add_new_mr_router.message(Meter_Readings_States.edit_mr_hw)
 @add_new_mr_router.message(Meter_Readings_States.edit_mr_cw)
@@ -327,7 +340,12 @@ async def msg(msg: Message, state: FSMContext):
     from main import redis as r
     text_value = (msg.text or "").strip()
     if not (text_value.isdigit() and int(text_value) > 0 and len(text_value) < 20):
-        await msg.answer('Введите пожалуйста число с счетчика, без других символов')
+        editing = (await state.get_data()).get('edit_mr_w', '')
+        hint = f'Счётчик №<b>{escape(str(editing))}</b>. ' if editing else ''
+        await msg.answer(
+            f'{hint}Введите пожалуйста число с счётчика, без других символов',
+            parse_mode='HTML',
+        )
         return
 
     new_value = int(text_value)
@@ -364,5 +382,9 @@ async def msg(msg: Message, state: FSMContext):
             counter+=1
         await msg.answer(text=all_mr_water_text,reply_markup=save_keyboard())
     else:
-        await msg.answer('Введите пожалуйста число с счетчика, без других символов')
+        hint = f'Счётчик №<b>{escape(str(editing_value))}</b>. ' if editing_value else ''
+        await msg.answer(
+            f'{hint}Введите пожалуйста число с счётчика, без других символов',
+            parse_mode='HTML',
+        )
 

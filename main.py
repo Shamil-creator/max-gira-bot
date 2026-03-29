@@ -1,6 +1,12 @@
 import asyncio
 import logging
 import sys
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().parent / ".env", override=False)
 
 import asyncpg
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -18,6 +24,7 @@ from handlers.add_new_water_meter_readings import add_new_mr_router
 from handlers.admin_group import admin_router
 from handlers.admin_meter_handlers import admin_meter_router
 from handlers.check_payment_status import (
+    get_act_ku_payment_every_month,
     get_act_of_payment,
     get_invoice_msg_every_month,
     get_message_every_month,
@@ -44,18 +51,21 @@ dp = Dispatcher(bot=bot)
 redis = PostgresDraftStore(config.db_connection)
 
 CHAT_ID = int(config.chanel_id.get_secret_value().strip("'\""))
-scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
+SCHEDULER_TZ = ZoneInfo("Europe/Moscow")
+scheduler = AsyncIOScheduler(timezone=SCHEDULER_TZ)
 
 
 async def get_data(query: str, *params):
+    conn = None
     try:
         conn = await asyncpg.connect(config.db_connection)
-        result = await conn.fetch(query, *params)
-        await conn.close()
-        return result
+        return await conn.fetch(query, *params)
     except Exception as e:
         logger.error("DB error: %s", e)
         return None
+    finally:
+        if conn:
+            await conn.close()
 
 
 async def spam_scheduler(us_id):
@@ -72,6 +82,28 @@ async def spam_scheduler(us_id):
     logger.info("Spam scheduler started for user %s", us_id)
 
 
+async def reset_monthly_counter_status():
+    """Сбрасывает статусы подачи показаний для всех пользователей в начале месяца."""
+    from aiogram.fsm.storage.base import StorageKey
+
+    ids_record = await get_data("SELECT user_id FROM users")
+    if not ids_record:
+        return
+    for record in ids_record:
+        try:
+            user_id = int(record["user_id"])
+            key = StorageKey(bot_id=bot.id, chat_id=user_id, user_id=user_id)
+            data = await dp.fsm.storage.get_data(key=key)
+            data["counter_status_hw"] = False
+            data["counter_status_cw"] = False
+            data["counter_status_el"] = False
+            data["payment_confirmed"] = False
+            await dp.fsm.storage.set_data(key=key, data=data)
+        except Exception as e:
+            logger.warning("Не удалось сбросить счётчики для user_id=%s: %s", record["user_id"], e)
+    logger.info("Статусы показаний сброшены для всех пользователей")
+
+
 async def setup_scheduler():
     ids_record = await get_data("SELECT user_id FROM users")
     if not ids_record:
@@ -80,33 +112,48 @@ async def setup_scheduler():
     list_ids = [ids["user_id"] for ids in ids_record]
     logger.info("Scheduler setup for users: %s", list_ids)
 
-    for id_us in list_ids:
+    # Сброс статусов показаний 1-го числа каждого месяца в 00:01
+    scheduler.add_job(
+        reset_monthly_counter_status,
+        trigger=CronTrigger(day=1, hour=0, minute=1, timezone="Europe/Moscow"),
+        id="monthly_counter_reset",
+        replace_existing=True,
+    )
+
+    for i, id_us in enumerate(list_ids):
         scheduler.add_job(
             get_message_every_month,
-            trigger=CronTrigger(day=26, hour=15, minute=30, timezone="Europe/Moscow"),
+            trigger=CronTrigger(day="5-28", hour=12, minute=i * 2, timezone="Europe/Moscow"),
             args=[id_us],
             id=f"monthly_payment_msg_{id_us}",
             replace_existing=True,
         )
         scheduler.add_job(
             get_mr_message_every_month,
-            trigger=CronTrigger(day=26, hour=15, minute=31, timezone="Europe/Moscow"),
+            trigger=CronTrigger(day="10-15", hour=10, minute=i * 2, timezone="Europe/Moscow"),
             args=[id_us],
             id=f"monthly_mr_msg_{id_us}",
             replace_existing=True,
         )
         scheduler.add_job(
             get_invoice_msg_every_month,
-            trigger=CronTrigger(day=26, hour=15, minute=32, timezone="Europe/Moscow"),
+            trigger=CronTrigger(day="28-31", hour=3, minute=21 + i * 2, timezone="Europe/Moscow"),
             args=[id_us],
             id=f"monthly_invoice_msg_{id_us}",
             replace_existing=True,
         )
         scheduler.add_job(
             get_act_of_payment,
-            trigger=CronTrigger(day=26, hour=15, minute=33, timezone="Europe/Moscow"),
+            trigger=CronTrigger(day="28-31", hour=3, minute=22 + i * 2, timezone="Europe/Moscow"),
             args=[id_us],
             id=f"monthly_act_msg_{id_us}",
+            replace_existing=True,
+        )
+        scheduler.add_job(
+            get_act_ku_payment_every_month,
+            trigger=CronTrigger(day="28-31", hour=3, minute=23 + i * 2, timezone="Europe/Moscow"),
+            args=[id_us],
+            id=f"monthly_act_ku_msg_{id_us}",
             replace_existing=True,
         )
 

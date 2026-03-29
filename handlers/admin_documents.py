@@ -19,15 +19,17 @@ import asyncpg
 
 async def get_data(query: str, *params):
     """Основной метод работы с БД"""
+    conn = None
     try:
         import asyncpg
         conn = await asyncpg.connect(config.db_connection)
-        result = await conn.fetch(query, *params)
-        await conn.close()
-        return result
-    except Exception as e: 
+        return await conn.fetch(query, *params)
+    except Exception as e:
         logging.error(f"Ошибка БД: {e}")
         return None
+    finally:
+        if conn:
+            await conn.close()
 
 # Хранилище для файлов
 temp_documents = {}
@@ -379,7 +381,11 @@ async def proceed_with_sending(call: CallbackQuery, state: FSMContext, documents
         # Создаем и отправляем счет
         text_for_user = await get_volume_and_amount_month(user)
         file = await create_word(collected_data, user, count_users, info_list)
-        document = FSInputFile(file)
+        
+        from handlers.run import get_form_of_doing_info_business
+        fod_name = await get_form_of_doing_info_business(user)
+        nice_filename = f"Акт расчета КУ {fod_name} {period_str}.docx"
+        document = FSInputFile(file, filename=nice_filename)
         
         await bot.send_document(
             chat_id=int(user),
