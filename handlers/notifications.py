@@ -92,7 +92,6 @@ def yes_or_no_termination_keyboard():
 def get_menu_notification_keyboard():
     buttons = [
         [types.InlineKeyboardButton(text='Согласование ремонтных работ', callback_data='coordination_of_repair_work_cb')],
-        [types.InlineKeyboardButton(text='Уведомить о растрожении',style="danger", callback_data='notify_of_termination_cb')],
         [types.InlineKeyboardButton(text='Вернуться в меню',style="primary", callback_data='go_menu_cb')]
     ]
     keyboard = types.InlineKeyboardMarkup(inline_keyboard=buttons, resize_keyboard=True)

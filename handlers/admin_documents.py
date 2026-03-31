@@ -286,10 +286,12 @@ async def proceed_with_sending(call: CallbackQuery, state: FSMContext, documents
     )
     await asyncio.sleep(0.5)
     
-    # Подготовка периода
-    start = (datetime.now().replace(day=1) - timedelta(days=1)).replace(day=1).strftime("%d.%m.%Y")
-    end = (datetime.now().replace(day=1) - timedelta(days=1)).strftime("%d.%m.%Y")
-    prev = datetime.now().replace(day=1) - timedelta(days=1)
+    # Подготовка периода: прошлый месяц (1-е число -> последний день)
+    prev_month_last_day = datetime.now().replace(day=1) - timedelta(days=1)
+    prev_month_first_day = prev_month_last_day.replace(day=1)
+    start = prev_month_first_day.strftime("%d.%m.%Y")
+    end = prev_month_last_day.strftime("%d.%m.%Y")
+    prev = prev_month_last_day
     prev_month_name_en = prev.strftime("%B")
     prev_year = prev.strftime("%Y")
     

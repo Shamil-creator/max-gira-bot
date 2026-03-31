@@ -59,8 +59,14 @@ def _fill_template(template_path: str, output_path: str,
 
     def _add_string(text) -> int:
         nonlocal ss_count
-        escaped = _xml_escape(str(text))
-        new_si_entries.append(f'<si><t>{escaped}</t></si>')
+        if isinstance(text, str) and text.startswith('<rich>'):
+            raw_xml = text[6:]  # strip '<rich>'
+            if raw_xml.endswith('</rich>'):
+                raw_xml = raw_xml[:-7]  # strip '</rich>'
+            new_si_entries.append(f'<si>{raw_xml}</si>')
+        else:
+            escaped = _xml_escape(str(text))
+            new_si_entries.append(f'<si><t>{escaped}</t></si>')
         idx = ss_count
         ss_count += 1
         return idx
@@ -204,7 +210,7 @@ def get_text_work_in_act(number_agreement, current_date):
     start_date = datetime(current_date.year, current_date.month, 1)
     last_day_in_this_month = calendar.monthrange(current_date.year, current_date.month)[1]
     last_date = date(current_date.year, current_date.month, last_day_in_this_month)
-    text = f'Услуги аренды по договору аренды нежилого помещения {agr_num}{agr_date}. За период с {start_date.strftime("%d.%m.%Y")} по {last_date.strftime("%d.%m.%Y")}.'
+    text = f'Услуги аренды по договору аренды нежилого помещения №{agr_num}{agr_date}. За период с {start_date.strftime("%d.%m.%Y")} по {last_date.strftime("%d.%m.%Y")}.'
     return text
 
 def sum_propisyu_full(summa):
@@ -357,6 +363,8 @@ def get_short_fio(fio):
 
 async def create_layoat_for_user(name_company, name_company_tenant, current_date, final_price, square, agreement, full_name_tenant, act_number, tenant_director_title='Директор'):
     price_rub_cop = str(final_price).split('.')
+    rub_part = price_rub_cop[0]
+    cop_part = price_rub_cop[1] if len(price_rub_cop) > 1 else '00'
     short_full_name_tenant = get_short_fio(full_name_tenant)
 
     if isinstance(current_date, str):
@@ -367,83 +375,81 @@ async def create_layoat_for_user(name_company, name_company_tenant, current_date
             except ValueError:
                 continue
 
-    act_text = f'Акт №{act_number} от {current_date.strftime("%d.%m.%Y")}'
+    act_text = f'Акт за аренду №{act_number} от {current_date.strftime("%d.%m.%Y")}'
     text_work_in_act = get_text_work_in_act(agreement, current_date)
 
     cell_values = {
+        'A3':  act_text,
+        'A5':  f'{start_text_in_a5_ab5}{name_company}',
+        'A7':  f'{start_text_in_a7_ab7}{name_company_tenant}',
         'C11': text_work_in_act,
-        'T11': str(square),
+        'T11': square,
+        'W11': 'кв.м',
         'Y11': final_price,
+        'Y13': final_price,
+        'A16': f'{start_text_in_a16_ab16}{rub_part} руб. {cop_part} коп.',
+        'A17': sum_propisyu_full(final_price),
+        'A22': f'{director} {name_company}',
+        'T22': f'{tenant_director_title} {name_company_tenant}',
+        'A24': 'Попова Я.В. __________',
+        'T24': f'{short_full_name_tenant} ________________',
     }
-
-    new_rows = {
-        3:  {'A': act_text},
-        5:  {'A': f'{start_text_in_a5_ab5} {name_company}'},
-        7:  {'A': f'{start_text_in_a7_ab7} {name_company_tenant}'},
-        14: {'Y': final_price},
-        16: {'A': f'{start_text_in_a16_ab16} {price_rub_cop[0]} руб. {price_rub_cop[1]} коп.'},
-        17: {'A': f'({sum_propisyu_full(final_price)})'},
-        19: {'A': text_for_user_accept_data_A19_AB19},
-        21: {'A': start_text_in_a5_ab5, 'T': start_text_in_a7_ab7},
-        22: {'A': f'{director} {name_company}', 'T': f'{tenant_director_title} {name_company_tenant}'},
-        24: {'A': 'Попова Я.В.', 'T': short_full_name_tenant},
-    }
-
-    extra_merges = [
-        'A3:AA3', 'A5:AB5', 'A7:AB7',
-        'Y14:Z14', 'A16:AB16', 'A17:AA17', 'A19:AB19',
-        'A21:E21', 'T21:AB21',
-        'A22:P22', 'T22:AB22',
-        'A24:P24', 'T24:AB24',
-    ]
 
     name_file = f'Акт на оплату арендного платежа для {name_company_tenant}'
     temp_dir = tempfile.gettempdir()
     temp_file_path = os.path.join(temp_dir, f"{name_file}_{next(tempfile._get_candidate_names())}.xlsx")
 
-    _fill_template('docs/create_layout_us.xlsx', temp_file_path, cell_values,
-                    new_rows=new_rows, extra_merges=extra_merges)
+    _fill_template('docs/create_layout_us.xlsx', temp_file_path, cell_values)
     return temp_file_path
 
-async def create_invoice_for_payment_for_user(act_number, full_name_company, agreement, price, target_date=None):
-    months_ru = {
-        1: 'январь', 2: 'февраль', 3: 'март', 4: 'апрель',
-        5: 'май', 6: 'июнь', 7: 'июль', 8: 'август',
-        9: 'сентябрь', 10: 'октябрь', 11: 'ноябрь', 12: 'декабрь'
-    }
+async def create_invoice_for_payment_for_user(act_number, name_company, name_company_tenant,
+                                               agreement, price, square,
+                                               full_name_tenant, tenant_director_title='Директор',
+                                               target_date=None):
     if target_date is None:
         target_date = datetime.now().replace(day=1)
 
     first_day = target_date.replace(day=1).strftime("%d.%m.%Y")
     fifth_day = target_date.replace(day=5).strftime("%d.%m.%Y")
-    period_str = f"{months_ru[target_date.month]} {target_date.year}"
+    text_work_in_act = get_text_work_in_act(agreement, target_date)
 
-    agreement_list = agreement.split(' ')
-    agr_num = agreement_list[0] if len(agreement_list) > 0 else ""
-    agr_date = f" от {agreement_list[1]}" if len(agreement_list) > 1 else ""
+    price_val = float(price)
+    price_formatted = f"{price_val:.2f}"
+
+    buyer_escaped = _xml_escape(name_company_tenant)
+    buyer_rich = (
+        '<rich>'
+        '<r><rPr><sz val="12"/><rFont val="Times New Roman"/><family val="1"/></rPr>'
+        '<t xml:space="preserve">Покупатель: </t></r>'
+        '<r><rPr><b/><sz val="12"/><rFont val="Times New Roman"/><family val="1"/></rPr>'
+        f'<t>{buyer_escaped}</t></r>'
+    )
 
     cell_values = {
-        'A5': f'Счет на оплату №{act_number} от {first_day}',
-        'A7': f'Покупатель: {full_name_company}',
-        'C9': f'Услуги аренды за {period_str}. По договору аренды {agr_num}{agr_date}.',
-        'I9': price,
-        'K9': price,
+        'A5':  f'Счет на оплату №{act_number} от {first_day}',
+        'A7':  buyer_rich,
+        'C9':  text_work_in_act,
+        'I9':  price_val,
+        'K9':  price_val,
         'A10': f'Оплатить до:                                                                   {fifth_day}',
-        'L11': price,
-        'A12': f'Всего наименований 1, на сумму {price} руб.',
+        'L11': price_val,
+        'A12': f'Всего наименований 1, на сумму {price_formatted} руб.',
         'B13': f'({sum_propisyu_full(price)})',
     }
 
-    cleaned = full_name_company.replace('"', '')
+    cleaned = name_company_tenant.replace('"', '')
     name_file = f'Счет на оплату арендного платежа для {cleaned}'
     temp_dir = tempfile.gettempdir()
     temp_file_path = os.path.join(temp_dir, f"{name_file}_{next(tempfile._get_candidate_names())}.xlsx")
 
-    _fill_template('docs/invoice_for_payment.xlsx', temp_file_path, cell_values)
+    _fill_template('docs/Счет на оплату Аренда.xlsx', temp_file_path, cell_values)
     return temp_file_path
 
 
-async def create_invoice_for_ku_for_user(act_number, full_name_company, agreement, price, start_period, end_period, target_date=None):
+async def create_invoice_for_ku_for_user(act_number, name_company, name_company_tenant,
+                                         agreement, price, square, start_period, end_period,
+                                         full_name_tenant, tenant_director_title='Директор',
+                                         target_date=None):
     if target_date is None:
         target_date = datetime.now().replace(day=1)
 
@@ -452,34 +458,51 @@ async def create_invoice_for_ku_for_user(act_number, full_name_company, agreemen
 
     agreement_list = agreement.split(' ')
     agr_num = agreement_list[0] if len(agreement_list) > 0 else ""
-    agr_date = agreement_list[1] if len(agreement_list) > 1 else ""
+    agr_date = f" от {agreement_list[1]}г." if len(agreement_list) > 1 else ""
+
+    text_work = (
+        f'Возмещение затрат на электроснабжение, отопление, коммунальные услуги '
+        f'по договору аренды нежилого помещения №{agr_num}{agr_date} '
+        f'за период с {start_period}г. по {end_period}г.'
+    )
+
+    price_val = float(price)
+    price_formatted = f"{price_val:.2f}"
+
+    buyer_escaped = _xml_escape(name_company_tenant)
+    buyer_rich = (
+        '<rich>'
+        '<r><rPr><sz val="12"/><rFont val="Times New Roman"/><family val="1"/></rPr>'
+        '<t xml:space="preserve">Покупатель: </t></r>'
+        '<r><rPr><b/><sz val="12"/><rFont val="Times New Roman"/><family val="1"/></rPr>'
+        f'<t>{buyer_escaped}</t></r>'
+    )
 
     cell_values = {
-        'A5': f'Счет на оплату №{act_number} от {first_day}',
-        'A7': f'Покупатель: {full_name_company}',
-        'C9': (
-            f'Возмещение затрат на электроснабжение, отопление, коммунальные услуги '
-            f'по договору аренды нежилого помещения №{agr_num} от {agr_date} '
-            f'за период с {start_period} по {end_period}.'
-        ),
-        'I9': price,
-        'K9': price,
+        'A5':  f'Счет на оплату №{act_number} от {first_day}',
+        'A7':  buyer_rich,
+        'C9':  text_work,
+        'I9':  price_val,
+        'K9':  price_val,
         'A10': f'Оплатить до:                                                                   {fifth_day}',
-        'L11': price,
-        'A12': f'Всего наименований 1, на сумму {price} руб.',
+        'L11': price_val,
+        'A12': f'Всего наименований 1, на сумму {price_formatted} руб.',
         'B13': f'({sum_propisyu_full(price)})',
     }
 
-    cleaned = full_name_company.replace('"', '')
+    cleaned = name_company_tenant.replace('"', '')
     name_file = f'Счет на оплату КУ для {cleaned}'
     temp_dir = tempfile.gettempdir()
     temp_file_path = os.path.join(temp_dir, f"{name_file}_{next(tempfile._get_candidate_names())}.xlsx")
 
-    _fill_template('docs/invoice_for_payment.xlsx', temp_file_path, cell_values)
+    _fill_template('docs/Счет на оплату КУ.xlsx', temp_file_path, cell_values)
     return temp_file_path
 
 
-async def create_act_payment_ku_for_user(act_number, full_name_company, agreement, price, start_period, end_period, target_date=None):
+async def create_act_payment_ku_for_user(act_number, name_company, name_company_tenant,
+                                         agreement, price, square, start_period, end_period,
+                                         full_name_tenant, tenant_director_title='Директор',
+                                         target_date=None):
     months_ru = {
         1: 'январь', 2: 'февраль', 3: 'март', 4: 'апрель',
         5: 'май', 6: 'июнь', 7: 'июль', 8: 'август',
@@ -492,25 +515,39 @@ async def create_act_payment_ku_for_user(act_number, full_name_company, agreemen
 
     agreement_list = agreement.split(' ')
     agr_num = agreement_list[0] if len(agreement_list) > 0 else ""
-    agr_date = agreement_list[1] if len(agreement_list) > 1 else ""
+    agr_date = f" от {agreement_list[1]}" if len(agreement_list) > 1 else ""
+
+    text_work = (
+        f'Возмещение затрат на электроснабжение, отопление, коммунальные услуги '
+        f'по договору аренды нежилого помещения №{agr_num}{agr_date}. '
+        f'За период с {start_period} по {end_period}.'
+    )
+
+    price_str = str(price)
+    price_parts = price_str.split('.')
+    rub_part = price_parts[0]
+    cop_part = price_parts[1] if len(price_parts) > 1 else '00'
+
+    short_fio = get_short_fio(full_name_tenant)
 
     cell_values = {
-        'A5': f'Акт №{act_number} КУ {month_name} {target_date.year}',
-        'A7': f'Покупатель: {full_name_company}',
-        'C9': (
-            f'Возмещение затрат на электроснабжение, отопление, коммунальные услуги '
-            f'по договору аренды нежилого помещения №{agr_num} от {agr_date} '
-            f'за период с {start_period} по {end_period}.'
-        ),
-        'I9': price,
-        'K9': price,
-        'A10': '',
-        'L11': price,
-        'A12': f'Всего наименований 1, на сумму {price} руб.',
-        'B13': f'({sum_propisyu_full(price)})',
+        'A3':  f'Акт №{act_number} КУ {month_name} {target_date.year}',
+        'A5':  f'{start_text_in_a5_ab5}{name_company}',
+        'A7':  f'{start_text_in_a7_ab7}{name_company_tenant}',
+        'C11': text_work,
+        'T11': square,
+        'W11': 'кв.м',
+        'Y11': price,
+        'Y13': price,
+        'A16': f'{start_text_in_a16_ab16}{rub_part} руб. {cop_part} коп.',
+        'A17': sum_propisyu_full(price),
+        'A22': f'{director} {name_company}',
+        'T22': f'{tenant_director_title} {name_company_tenant}',
+        'A24': 'Попова Я.В. __________',
+        'T24': f'{short_fio} ________________',
     }
 
-    cleaned = full_name_company.replace('"', '')
+    cleaned = name_company_tenant.replace('"', '')
     name_file = f'Акт КУ для {cleaned}'
     temp_dir = tempfile.gettempdir()
     temp_file_path = os.path.join(temp_dir, f"{name_file}_{next(tempfile._get_candidate_names())}.xlsx")

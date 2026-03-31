@@ -61,7 +61,10 @@ def main() -> int:
         print(r.stderr or "pg_dump failed", file=sys.stderr)
         return r.returncode
     text = r.stdout
+    # Пара \restrict / \unrestrict привязана к ключу pg_dump; без начальной \restrict
+    # psql падает на \unrestrict — убираем обе строки для переносимого дампа.
     text = re.sub(r"^\\restrict .*\n", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\\unrestrict .*\n", "", text, flags=re.MULTILINE)
     OUT.parent.mkdir(parents=True, exist_ok=True)
     OUT.write_text(text, encoding="utf-8")
     print(f"OK: {OUT} ({OUT.stat().st_size} bytes)")

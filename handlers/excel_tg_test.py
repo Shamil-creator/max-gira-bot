@@ -598,12 +598,24 @@ async def compute_ku_total_from_excel(id_us, ind=None, unexp=0.0):
     for i in range(2, 11, 2):
         r = data[i - 1]
         prev_v, curr_v = float(r[0]), float(r[3])
+        diff_v = curr_v - prev_v
+        key = {2: 'electro', 4: 'water_cold', 6: 'water_hot'}.get(i)
         rate_v = float(data[i][5])
-        if rate_v == 0:
-            key = {2: 'electro', 4: 'water_cold', 6: 'water_hot'}.get(i)
+        # Prefer admin-provided rate (ставка) if present; this avoids cases where
+        # the tenant sheet cell contains amount instead of rate.
+        ind_rate = None
+        if key:
+            ind_rate = ind.get(key, {}).get('tariff')
+        try:
+            if ind_rate is not None and float(ind_rate) > 0:
+                rate_v = float(ind_rate)
+        except Exception:
+            pass
+        if rate_v == 0 and key:
             rate_v = mast.get(key, 0)
+        # Сумма = текущий показатель × тариф (как было)
         sum_v = float(r[5]) or round(curr_v * rate_v, 2)
-        final.append([prev_v, curr_v, curr_v, sum_v, rate_v])
+        final.append([prev_v, curr_v, diff_v, sum_v, rate_v])
 
     expl_v = float(data[10][5]) if len(data) > 10 and len(data[10]) > 5 else round(float(ind.get('expl', {}).get('amount', 0)) / 8, 2)
     unexp_v = float(data[11][5]) if len(data) > 11 and len(data[11]) > 5 else float(unexp)
@@ -661,12 +673,24 @@ async def create_word(*args, **kwargs):
         for i in range(2, 11, 2): # Electro, CW, HW, Heat, Expl
             r = data[i-1] # Row in data
             prev_v, curr_v = float(r[0]), float(r[3])
+            diff_v = curr_v - prev_v
+            key = {2: 'electro', 4: 'water_cold', 6: 'water_hot'}.get(i)
             rate_v = float(data[i][5])
-            if rate_v == 0:
-                key = {2: 'electro', 4: 'water_cold', 6: 'water_hot'}.get(i)
+            # Prefer admin-provided rate (ставка) if present; this avoids cases where
+            # the tenant sheet cell contains amount instead of rate.
+            ind_rate = None
+            if key:
+                ind_rate = ind.get(key, {}).get('tariff')
+            try:
+                if ind_rate is not None and float(ind_rate) > 0:
+                    rate_v = float(ind_rate)
+            except Exception:
+                pass
+            if rate_v == 0 and key:
                 rate_v = mast.get(key, 0)
+            # Сумма = текущий показатель × тариф (как было)
             sum_v = float(r[5]) or round(curr_v * rate_v, 2)
-            final.append([prev_v, curr_v, curr_v, sum_v, rate_v])
+            final.append([prev_v, curr_v, diff_v, sum_v, rate_v])
         
         # Individual values
         expl_v = float(data[10][5]) if len(data) > 10 and len(data[10]) > 5 else round(float(ind.get('expl', {}).get('amount', 0))/8, 2)
@@ -680,8 +704,13 @@ async def create_word(*args, **kwargs):
         doc = Document(res_p)
         
         sub = {
-            'start_day': str(info[1]), 'thisday': datetime.now().strftime("%d.%m.%Y"),
-            'end_day': str(info[2]), 'monthyear': str(info[3]), 'square': str(square), 'tenantshortsfp': short_n
+            'start_day': str(info[1]),
+            # Дата в правом верхнем углу = конечная дата периода
+            'thisday': str(info[2]),
+            'end_day': str(info[2]),
+            'monthyear': str(info[3]),
+            'square': f"{square} кв.м.",
+            'tenantshortsfp': short_n
         }
         if id_form == 1:
             DIRECTOR_TITLE_GEN = {
@@ -691,7 +720,10 @@ async def create_word(*args, **kwargs):
             raw_title = rec[0].get('director_title') or 'Директор' if rec else 'Директор'
             sub['tenant_company'] = rec[0]['name_company'] if rec else '—'
             sub['tenant_director_title'] = DIRECTOR_TITLE_GEN.get(raw_title, raw_title.lower())
-            sub['tenant_fio'] = f"{rec[0]['surname']} {rec[0]['first_name']} {rec[0]['patronymic']}" if rec else '—'
+            if rec and rec[0].get('director_fio_genitive'):
+                sub['tenant_fio'] = rec[0]['director_fio_genitive']
+            else:
+                sub['tenant_fio'] = f"{rec[0]['surname']} {rec[0]['first_name']} {rec[0]['patronymic']}" if rec else '—'
         else:
             sub['tenant_fio'] = f"{rec[0]['surname']} {rec[0]['first_name']} {rec[0]['patronymic']}" if rec else '—'
         
@@ -715,6 +747,12 @@ async def create_word(*args, **kwargs):
                 placeholder_idx = list(par).index(p._element)
                 par.remove(p._element)
                 tbl = doc.add_table(rows=9, cols=6)
+                tbl.autofit = False
+                from docx.shared import Cm
+                col_widths = [Cm(5.00), Cm(3.00), Cm(2.25), Cm(2.01), Cm(2.20), Cm(2.26)]
+                for j, width in enumerate(col_widths):
+                    for row in tbl.rows:
+                        row.cells[j].width = width
                 for c in tbl._element.xpath('.//w:tc'):
                     b = OxmlElement('w:tcBorders')
                     for s in ['top', 'left', 'bottom', 'right']:
@@ -723,24 +761,25 @@ async def create_word(*args, **kwargs):
                         b.append(e)
                     c.get_or_add_tcPr().append(b)
                 
-                h = ["Услуга", "Предыдущий", "Текущий", "Разница", "Ставка", "Сумма (руб.)"]
+                h = ["Услуга", "Предыдущий", "Текущий", "Разница", "Тариф", "Сумма (руб.)"]
                 for j, txt in enumerate(h):
                     tbl.cell(0, j).text = txt
-                    for r in tbl.cell(0, j).paragraphs[0].runs: fmt(r, 14, True)
+                    for r in tbl.cell(0, j).paragraphs[0].runs: fmt(r, 12, True)
                 
+                drainage_volume = final[1][2] + final[2][2]
                 rows = [
-                    ["Электроэнергия", str(final[0][0]), str(final[0][1]), str(final[0][2]), str(final[0][4]), str(final[0][3])],
-                    ["Холодная вода", str(final[1][0]), str(final[1][1]), str(final[1][2]), str(final[1][4]), str(final[1][3])],
-                    ["Горячая вода", str(final[2][0]), str(final[2][1]), str(final[2][2]), str(final[2][4]), str(final[2][3])],
+                    ["Электроэнергия\n(кВт·ч)", str(final[0][0]), str(final[0][1]), str(final[0][2]), str(final[0][4]), str(final[0][3])],
+                    ["Холодная вода (м³)", str(final[1][0]), str(final[1][1]), str(final[1][2]), str(final[1][4]), str(final[1][3])],
+                    ["Горячая вода (м³)", str(final[2][0]), str(final[2][1]), str(final[2][2]), str(final[2][4]), str(final[2][3])],
+                    ["Водоотведение (м³)", "—", str(drainage_volume), "—", str(dr_rate), str(dr_sum)],
                     ["Отопление", "—", "—", "—", "—", str(final[3][3])],
-                    ["Эксплуатация", "—", "—", "—", "—", str(expl_v)],
-                    ["Водоотведение", "—", str(final[1][2]+final[2][2]), "—", str(dr_rate), str(dr_sum)],
+                    ["Коммунальные услуги", "—", "—", "—", "—", str(expl_v)],
                     ["Непредвиденные", "—", str(unexp_v), "—", "—", str(unexp_v)]
                 ]
                 for i, row in enumerate(rows, 1):
                     for j, val in enumerate(row):
                         tbl.cell(i, j).text = val
-                        for r in tbl.cell(i, j).paragraphs[0].runs: fmt(r)
+                        for r in tbl.cell(i, j).paragraphs[0].runs: fmt(r, 12)
                 
                 tot = round(sum([float(r[5]) for r in rows if r[5] != "—"]), 2)
                 itogo_label = "ИТОГО" if id_form == 1 else "ИТОГО К ОПЛАТЕ"
@@ -749,6 +788,14 @@ async def create_word(*args, **kwargs):
                     for r in cell.paragraphs[0].runs: fmt(r, 12, True)
                 par.remove(tbl._element)
                 par.insert(placeholder_idx, tbl._element)
+                # Уменьшаем межстрочные интервалы во всех ячейках таблицы (но оставляем 4pt для "длины")
+                from docx.shared import Pt as PtShared
+                for row in tbl.rows:
+                    for cell in row.cells:
+                        for paragraph in cell.paragraphs:
+                            paragraph.paragraph_format.space_before = PtShared(4)
+                            paragraph.paragraph_format.space_after = PtShared(4)
+                            paragraph.paragraph_format.line_spacing = 1.0
                 break
         doc.save(res_p)
         return (res_p, tot)

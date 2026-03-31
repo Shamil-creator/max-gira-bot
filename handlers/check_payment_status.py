@@ -174,16 +174,28 @@ async def build_rent_invoice(id):
     fod_name = await get_form_of_doing_info_business(id)
     if not records_list:
         return None
-    name = agreement = bid = number_act = None
-    for rec in records_list:
-        name = rec['name_company']
-        agreement = rec['agreement']
-        bid = rec['bid']
-        number_act = rec['number_act']
+    rec = records_list[0]
+    name = rec['name_company']
+    agreement = rec['agreement']
+    bid = rec['bid']
+    square = rec['square']
+    number_act = rec['number_act']
+    director_title = rec.get('director_title')
     number_act = int(number_act) + 1 if number_act is not None else 1
     full_name = f'''{fod_name} "{name}"'''
+    full_name_tenant = f"{rec['surname']} {rec['first_name']} {rec['patronymic']}"
 
-    xlsx_path = await create_invoice_for_payment_for_user(number_act, full_name, agreement, bid, target_date)
+    xlsx_path = await create_invoice_for_payment_for_user(
+        act_number=number_act,
+        name_company='ООО "ГИРА"',
+        name_company_tenant=full_name,
+        agreement=agreement,
+        price=bid,
+        square=square,
+        full_name_tenant=full_name_tenant,
+        tenant_director_title=director_title or 'Директор',
+        target_date=target_date,
+    )
     nice_filename = f"Счет на оплату аренды {target_date.strftime('%m.%Y')}.xlsx"
     caption = 'Здравствуйте! Ваш счет за текущий месяц'
     return xlsx_path, nice_filename, caption
@@ -250,8 +262,8 @@ async def build_rent_act(id):
     end_str = end_of_month.strftime("%d.%m.%Y")
 
     xlsx_path = await create_layoat_for_user('ООО "ГИРА"', tenant_with_form, end_str, bid, square, agreement, full_name_tenant, number_act, tenant_director_title=director_title or 'Директор')
-    nice_filename = f"Акт {today.strftime('%m.%Y')}.xlsx"
-    caption = 'Здравствуйте! Ваш Акт за текущий месяц'
+    nice_filename = f"Акт за аренду №{number_act} от {end_str}.xlsx"
+    caption = 'Здравствуйте! Ваш Акт за аренду за текущий месяц'
     return xlsx_path, nice_filename, caption
 
 
@@ -319,6 +331,7 @@ async def build_ku_act_payment(id):
     number_act_ku = biz.get('number_act_ku')
     ku_number = int(number_act_ku or 0) + 1
     full_name = f'''{fod_name} "{biz['name_company']}"'''
+    full_name_tenant = f"{biz['surname']} {biz['first_name']} {biz['patronymic']}"
 
     last_day = calendar.monthrange(today.year, today.month)[1]
     start_period = today.replace(day=1).strftime("%d.%m.%Y")
@@ -326,8 +339,17 @@ async def build_ku_act_payment(id):
 
     from handlers.create_layout import create_act_payment_ku_for_user
     xlsx_path = await create_act_payment_ku_for_user(
-        ku_number, full_name, agreement, ku_total,
-        start_period, end_period, target_date=today
+        act_number=ku_number,
+        name_company='ООО "ГИРА"',
+        name_company_tenant=full_name,
+        agreement=agreement,
+        price=ku_total,
+        square=biz.get('square', 0),
+        start_period=start_period,
+        end_period=end_period,
+        full_name_tenant=full_name_tenant,
+        tenant_director_title=biz.get('director_title') or 'Директор',
+        target_date=today,
     )
 
     months_ru = {
@@ -340,6 +362,101 @@ async def build_ku_act_payment(id):
     caption = 'Здравствуйте! Ваш акт оплаты КУ за текущий месяц'
     return xlsx_path, nice_filename, caption
 
+
+async def build_ku_invoice(id):
+    """Generate KU invoice (Счет на оплату КУ) xlsx. Returns (path, filename, caption) or None."""
+    today = datetime.now()
+    records_list = await get_info_business(id)
+    fod_name = await get_form_of_doing_info_business(id)
+    if not records_list:
+        return None
+
+    records = await get_data('SELECT id_business FROM users WHERE User_Id = $1', str(id))
+    if not records or not records[0]['id_business']:
+        return None
+    id_business = records[0]['id_business']
+
+    meters_check = await get_data(
+        'SELECT COUNT(*) as cnt FROM us_readings WHERE business_id = $1',
+        id_business
+    )
+    if not meters_check or meters_check[0]['cnt'] == 0:
+        return None
+
+    from handlers.excel_tg_test import compute_ku_total_from_excel
+    ku_total = await compute_ku_total_from_excel(id)
+    if ku_total is None or ku_total == 0:
+        return None
+
+    biz = records_list[0]
+    agreement = biz.get('agreement', '')
+    number_act_ku = biz.get('number_act_ku')
+    ku_number = int(number_act_ku or 0) + 1
+    full_name = f'''{fod_name} "{biz['name_company']}"'''
+    full_name_tenant = f"{biz['surname']} {biz['first_name']} {biz['patronymic']}"
+
+    last_day = calendar.monthrange(today.year, today.month)[1]
+    start_period = today.replace(day=1).strftime("%d.%m.%Y")
+    end_period = today.replace(day=last_day).strftime("%d.%m.%Y")
+
+    from handlers.create_layout import create_invoice_for_ku_for_user
+    xlsx_path = await create_invoice_for_ku_for_user(
+        act_number=ku_number,
+        name_company='ООО "ГИРА"',
+        name_company_tenant=full_name,
+        agreement=agreement,
+        price=ku_total,
+        square=biz.get('square', 0),
+        start_period=start_period,
+        end_period=end_period,
+        full_name_tenant=full_name_tenant,
+        tenant_director_title=biz.get('director_title') or 'Директор',
+        target_date=today,
+    )
+
+    months_ru = {
+        1: 'январь', 2: 'февраль', 3: 'март', 4: 'апрель',
+        5: 'май', 6: 'июнь', 7: 'июль', 8: 'август',
+        9: 'сентябрь', 10: 'октябрь', 11: 'ноябрь', 12: 'декабрь'
+    }
+    month_name = months_ru[today.month]
+    nice_filename = f"Счет на оплату КУ {month_name} {today.year}.xlsx"
+    caption = 'Здравствуйте! Ваш счёт на оплату КУ за текущий месяц'
+    return xlsx_path, nice_filename, caption
+
+
+async def get_ku_invoice_every_month(id, force=False):
+    from main import bot
+    try:
+        today = datetime.now()
+        if not force:
+            last_day = calendar.monthrange(today.year, today.month)[1]
+            if today.day != last_day:
+                return
+
+        result = await build_ku_invoice(id)
+        if result is None:
+            logging.warning("[invoice_ku] Нет данных / счётчиков / суммы КУ для user_id=%s — пропуск", id)
+            return
+        xlsx_path, nice_filename, caption = result
+
+        document = FSInputFile(xlsx_path, filename=nice_filename)
+        sent_message = await bot.send_document(
+            chat_id=id, document=document, caption=caption
+        )
+        logging.info("[invoice_ku] Счёт КУ отправлен user_id=%s", id)
+
+        records = await get_data('SELECT id_business FROM users WHERE User_Id = $1', str(id))
+        id_business = records[0]['id_business']
+
+        today_date = date.today()
+        file_id = sent_message.document.file_id
+        await new_data_insert(
+            'INSERT INTO business_documents(id_business, file_id, date_added, file_name) VALUES ($1, $2, $3, $4)',
+            id_business, file_id, today_date, nice_filename
+        )
+    except Exception as e:
+        logging.error("[invoice_ku] Ошибка при отправке счёта КУ user_id=%s: %s", id, e, exc_info=True)
 
 async def get_act_ku_payment_every_month(id, force=False):
     from main import bot

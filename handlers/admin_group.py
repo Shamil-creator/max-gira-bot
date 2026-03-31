@@ -54,7 +54,7 @@ def get_type_labels():
 def service_keyboard():
     """Клавиатура выбора услуги"""
     buttons = [
-        [InlineKeyboardButton(text="🔥 Отопление, Экс. услуги, Непредвиденные", callback_data="service_heat")],
+        [InlineKeyboardButton(text="🔥 Отопление, Коммунальные услуги, Непредвиденные", callback_data="service_heat")],
         [InlineKeyboardButton(text="📊 Общие показатели", callback_data="service_common")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_admin_menu")]
     ]
@@ -177,7 +177,7 @@ def validate_company_edit_field(param_key: str, new_value: str) -> Tuple[bool, s
         return True, "", d
     if param_key == "phone":
         return True, "", new_value
-    if param_key == "director_name":
+    if param_key == "director_name" or param_key == "director_fio_genitive":
         parts = new_value.split()
         if len(parts) < 3:
             return False, "Введите полное ФИО (минимум 3 слова).", None
@@ -461,6 +461,7 @@ async def admin_sendall(message: Message, bot: Bot):
         get_invoice_msg_every_month,
         get_act_of_payment,
         get_act_ku_payment_every_month,
+        get_ku_invoice_every_month,
         get_message_every_month,
         get_mr_message_every_month,
         get_data as cps_get_data,
@@ -481,6 +482,7 @@ async def admin_sendall(message: Message, bot: Bot):
         ("Напоминание о показаниях", get_mr_message_every_month, False),
         ("Счёт на оплату аренды", get_invoice_msg_every_month, True),
         ("Акт аренды", get_act_of_payment, True),
+        ("Счёт на оплату КУ", get_ku_invoice_every_month, True),
         ("Акт КУ", get_act_ku_payment_every_month, True),
     ]
 
@@ -1269,7 +1271,7 @@ async def proceed_with_sending_unexpected(call: CallbackQuery, state: FSMContext
         if user_unexp > 0:
             caption_parts.append(f'💰 Непредвиденные расходы: {user_unexp:.2f} руб.')
         if user_expl > 0:
-            caption_parts.append(f'🏢 Эксплуатационные услуги: {user_expl:.2f} руб.')
+            caption_parts.append(f'🏢 Коммунальные услуги: {user_expl:.2f} руб.')
         if caption_parts:
             caption += '\n\n' + '\n'.join(caption_parts)
         
@@ -3099,7 +3101,7 @@ async def proceed_with_final_save(call: CallbackQuery, state: FSMContext, bot: B
         if user_unexp_final > 0:
             caption_parts.append(f'💰 Непредвиденные расходы: {user_unexp_final:.2f} руб.')
         if user_expl_final > 0:
-            caption_parts.append(f'🏢 Эксплуатационные услуги: {user_expl_final:.2f} руб.')
+            caption_parts.append(f'🏢 Коммунальные услуги: {user_expl_final:.2f} руб.')
         if caption_parts:
             caption += '\n\n' + '\n'.join(caption_parts)
         
@@ -3161,10 +3163,19 @@ async def proceed_with_final_save(call: CallbackQuery, state: FSMContext, bot: B
                 ku_full_name = f'''{fod_name} "{biz['name_company']}"'''
                 ku_agreement = biz.get('agreement', '')
                 ku_number = int(biz.get('number_act_ku') or 0) + 1
+                ku_full_name_tenant = f"{biz['surname']} {biz['first_name']} {biz['patronymic']}"
 
                 ku_xlsx_path = await create_invoice_for_ku_for_user(
-                    ku_number, ku_full_name, ku_agreement, ku_total,
-                    start, end
+                    act_number=ku_number,
+                    name_company='ООО "ГИРА"',
+                    name_company_tenant=ku_full_name,
+                    agreement=ku_agreement,
+                    price=ku_total,
+                    square=biz.get('square', 0),
+                    start_period=start,
+                    end_period=end,
+                    full_name_tenant=ku_full_name_tenant,
+                    tenant_director_title=biz.get('director_title') or 'Директор',
                 )
                 ku_nice_filename = f"Счет на оплату КУ {period_str}.xlsx"
                 ku_document = FSInputFile(ku_xlsx_path, filename=ku_nice_filename)
@@ -4364,6 +4375,9 @@ async def build_company_detail_view(company_id: int) -> Optional[Tuple[str, Inli
     director_title_val = company_details.get('director_title')
     if director_title_val:
         info_lines.append(f"👔 <b>Должность:</b> {director_title_val}")
+    director_fio_genitive_val = company_details.get('director_fio_genitive')
+    if director_fio_genitive_val:
+        info_lines.append(f"👤 <b>ФИО в Р.П.:</b> {director_fio_genitive_val}")
     info_lines.extend([
         f"🏢 <b>Вид деятельности:</b> {company_details.get('activity_name', 'не указан')}",
         f"\n📊 <b>Счетчики:</b>\n{meters_text}",
@@ -4466,6 +4480,9 @@ async def create_edit_choice_keyboard(company_id: int, id_form: int = None) -> I
     if id_form == 1:
         rows.append([
             InlineKeyboardButton(text="👔 Должность руководителя", callback_data=f"edit_director_title:{company_id}")
+        ])
+        rows.append([
+            InlineKeyboardButton(text="👤 ФИО в Р.П.", callback_data=f"edit_genitive:{company_id}")
         ])
     rows.append([InlineKeyboardButton(text="🔙 Назад", callback_data=f"company:{company_id}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -4679,6 +4696,7 @@ async def edit_param_selected(callback: CallbackQuery, state: FSMContext):
         "edit_phone": ("телефон", "phone"),
         "edit_director": ("ФИО", "director_name"),
         "edit_activity": ("вид деятельности", "activity_type"),
+        "edit_genitive": ("ФИО в Р.П.", "director_fio_genitive"),
     }
     
     if action_part not in param_map:
@@ -4697,11 +4715,22 @@ async def edit_param_selected(callback: CallbackQuery, state: FSMContext):
     )
     
     from main import bot
+    
+    if param_key == "director_fio_genitive":
+        hint_text = " ('в лице кого?')\n<i>Пример: Иванова Ивана Ивановича</i>\n\n"
+    else:
+        hint_text = "\n\n"
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Отмена", callback_data=f"editcomp_{company_id}")]
+    ])
+
     await bot.send_message(
         chat_id=callback.message.chat.id,
-        text=f"✏️ Введите новое значение для <b>{param_name}</b>:\n\n"
+        text=f"✏️ Введите новое значение для <b>{param_name}</b>{hint_text}"
              f"Текущее значение: <code>{current_value}</code>\n\n"
              f"<i>Отправьте новое значение в ответе:</i>",
+        reply_markup=keyboard,
         parse_mode=ParseMode.HTML
     )
     await callback.answer()
@@ -4738,6 +4767,7 @@ async def process_edit_value(message: Message, state: FSMContext, bot: Bot):
         'phone': None,
         'director_name': None,
         'activity_type': None,
+        'director_fio_genitive': 'director_fio_genitive',
     }
     db_column = db_column_map.get(param_key)
     if param_key == 'director_name':
@@ -4794,6 +4824,12 @@ async def process_edit_value(message: Message, state: FSMContext, bot: Bot):
         f"📞 <b>Телефон:</b> {company_details.get('phone', 'не указан')}",
         f"👤 <b>ФИО:</b> {company_details.get('director_name', 'не указан')}"
     ]
+    director_title_val2 = company_details.get('director_title')
+    if director_title_val2:
+        info_lines.append(f"👔 <b>Должность:</b> {director_title_val2}")
+    director_fio_genitive_val2 = company_details.get('director_fio_genitive')
+    if director_fio_genitive_val2:
+        info_lines.append(f"👤 <b>ФИО в Р.П.:</b> {director_fio_genitive_val2}")
     
     keyboard = await create_company_actions_keyboard(company_id)
 
@@ -5369,6 +5405,41 @@ async def process_add_company(message: Message, state: FSMContext, bot: Bot):
             )
             await state.update_data(new_company=new_company, add_step=current_step + 1, add_message_id=sent_msg.message_id)
     
+    # Шаг 111 - ввод ФИО генерального директора в родительном падеже
+    elif current_step == 111:
+        error_text = None
+        fio_parts = new_value.split()
+        if len(fio_parts) < 3:
+            error_text = "❌ Введите полное ФИО (минимум 3 слова). Пример: Иванова Ивана Ивановича"
+        elif not re.match(r'^[а-яА-ЯёЁ\s\-]+$', new_value):
+            error_text = "❌ ФИО должно содержать только буквы, пробелы и дефисы."
+
+        if error_text:
+            try:
+                await bot.delete_message(chat_id=message.chat.id, message_id=add_message_id)
+            except:
+                pass
+            sent_msg = await message.answer(
+                text=f"<b>Шаг 12/13</b> - Введите <b>ФИО руководителя в родительном падеже</b>:\n\n"
+                     f"{error_text}\n"
+                     f"Попробуйте снова:",
+                parse_mode=ParseMode.HTML
+            )
+            await state.update_data(add_message_id=sent_msg.message_id)
+            return
+            
+        new_company['director_fio_genitive'] = new_value
+        try:
+            await bot.delete_message(chat_id=message.chat.id, message_id=add_message_id)
+        except:
+            pass
+        sent_msg = await message.answer(
+            text=f"✅ <b>ФИО руководителя</b> сохранено!\n\n"
+                 f"<b>Шаг 13/13</b> - Введите <b>вид деятельности</b>:",
+            parse_mode=ParseMode.HTML
+        )
+        await state.update_data(new_company=new_company, add_step=10, add_message_id=sent_msg.message_id)
+
     # Финальный шаг - ввод вида деятельности
     elif current_step == 10:
         new_company['activity_type'] = new_value
@@ -5390,7 +5461,9 @@ async def process_add_company(message: Message, state: FSMContext, bot: Bot):
         sfp_general_direcotr = new_company.get('director_name')
         gen_dir_list = sfp_general_direcotr.split(' ')
         director_title = new_company.get('director_title')
+        director_fio_genitive = new_company.get('director_fio_genitive')
         director_title_line = f"\n            👔 <b>Должность:</b> {director_title}" if director_title else ""
+        director_genitive_line = f"\n            👤 <b>ФИО в Р.П.:</b> {director_fio_genitive}" if director_fio_genitive else ""
         company_info = f"""
             📋 <b>ДАННЫЕ НОВОЙ КОМПАНИИ:</b>
 
@@ -5403,7 +5476,7 @@ async def process_add_company(message: Message, state: FSMContext, bot: Bot):
             📋 <b>Акт приема-передачи:</b> {acceptance_certificate}
             📞 <b>Телефон:</b> {phone}
             🔢 <b>ИНН:</b> {inn}
-            👤 <b>ФИО:</b> {sfp_general_direcotr}{director_title_line}
+            👤 <b>ФИО:</b> {sfp_general_direcotr}{director_title_line}{director_genitive_line}
             🏢 <b>Вид деятельности:</b> {activity_type}
         """
         
@@ -5421,8 +5494,8 @@ async def process_add_company(message: Message, state: FSMContext, bot: Bot):
         list_data=[agreement, inn, name_fod, name_company, activity_type, square, list_name, acceptance_certificate, sfp_list[0], sfp_list[1], sfp_list[2], end_agreement, phone]
         await copy_sheet_safe(list_name)
         await safe_add_to_excel(list_data)
-        await new_data_insert('INSERT INTO bussines(name_company, id_form, square, bid, acceptance_certificate, agreement, end_date_agreement, id_type_of_activity, sheet_name, surname, first_name, patronymic, phone, director_title) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)', 
-                            name_company, id_form_doing, square, bid, acceptance_certificate, agreement, end_agreement, id_toa, list_name, gen_dir_list[0], gen_dir_list[1], gen_dir_list[2], phone, director_title)
+        await new_data_insert('INSERT INTO bussines(name_company, id_form, square, bid, acceptance_certificate, agreement, end_date_agreement, id_type_of_activity, sheet_name, surname, first_name, patronymic, phone, director_title, director_fio_genitive) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)', 
+                            name_company, id_form_doing, square, bid, acceptance_certificate, agreement, end_agreement, id_toa, list_name, gen_dir_list[0], gen_dir_list[1], gen_dir_list[2], phone, director_title, director_fio_genitive)
         
 
         # ========== ИНТЕГРАЦИЯ С НОВЫМ РОУТЕРОМ ==========
@@ -5529,10 +5602,11 @@ async def select_director_title(callback: CallbackQuery, state: FSMContext):
 
     sent_msg = await callback.message.answer(
         text=f"✅ <b>Должность руководителя</b> выбрана: {title}\n\n"
-             f"<b>Шаг 12/12</b> - Введите <b>вид деятельности</b>:",
+             f"<b>Шаг 12/13</b> - Введите <b>ФИО руководителя в родительном падеже</b> ('в лице кого?'):\n"
+             f"<i>Пример: Иванова Ивана Ивановича</i>",
         parse_mode=ParseMode.HTML
     )
-    await state.update_data(new_company=new_company, add_step=10, add_message_id=sent_msg.message_id)
+    await state.update_data(new_company=new_company, add_step=111, add_message_id=sent_msg.message_id)
     await callback.answer()
 
 
@@ -5960,7 +6034,7 @@ async def unexpected_individual_input(message: Message, state: FSMContext, bot: 
     
     await message.answer(
         f"✅ Непредвиденные расходы: {amount} руб.\n\n"
-        f"🏢 <b>Эксплуатационные услуги</b> - {tenant_name}\n"
+        f"🏢 <b>Коммунальные услуги</b> - {tenant_name}\n"
         f"Введите сумму (в рублях) или 0 если их нет:\n"
         f"(например: 1200)",
         parse_mode="HTML"
@@ -5991,7 +6065,7 @@ async def expl_individual_input(message: Message, state: FSMContext, bot: Bot):
         f"🏢 Арендатор: {tenant_name}\n"
         f"🔥 Отопление: {heat_amount:.2f} ₽\n"
         f"💰 Непредвиденные: {unexpected:.2f} ₽\n"
-        f"🏢 Эксплуатация: {amount:.2f} ₽\n\n"
+        f"🏢 Коммунальные услуги: {amount:.2f} ₽\n\n"
         f"Все верно?",
         reply_markup=confirm_readings_keyboard(tenant_id),
         parse_mode="HTML"
